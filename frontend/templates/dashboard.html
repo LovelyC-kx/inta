@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Intan RHX Control Console</title>
+<style>
+:root {
+  --bg: #0d1014;
+  --panel: #151a21;
+  --panel2: #1b222c;
+  --panel3: #10151c;
+  --line: #2a3340;
+  --text: #e6ecf3;
+  --muted: #8d98a7;
+  --good: #33c58c;
+  --warn: #e8b14a;
+  --bad: #ee5a5a;
+  --blue: #68a7ff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+}
+header {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+  background: #10151b;
+}
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.title-block {
+  display: grid;
+  gap: 4px;
+}
+h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+.subtle {
+  color: var(--muted);
+  font-size: 12px;
+}
+.badges {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.badge {
+  min-width: 78px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #11161d;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+.badge.good { color: var(--good); border-color: #225a47; background: #102119; }
+.badge.warn { color: var(--warn); border-color: #5f4b21; background: #211a11; }
+.badge.bad { color: var(--bad); border-color: #683035; background: #241416; }
+main {
+  display: grid;
+  grid-template-columns: 430px minmax(0, 1fr);
+  gap: 16px;
+  padding: 16px;
+}
+.stack { display: grid; gap: 16px; }
+.panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.panel h2 {
+  margin: 0;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--blue);
+  text-transform: uppercase;
+}
+.body {
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.grid3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+input, select, textarea {
+  width: 100%;
+  height: 34px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #0f141b;
+  color: var(--text);
+  padding: 0 9px;
+  font-size: 13px;
+}
+textarea {
+  height: 72px;
+  padding: 9px;
+  resize: vertical;
+}
+button {
+  height: 34px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 12px;
+  background: #3b82f6;
+  color: white;
+  font-weight: 650;
+  cursor: pointer;
+}
+button.secondary { background: #364152; }
+button.warn { background: #8b5e16; }
+button.danger { background: #c2413d; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+.segmented button.active {
+  background: #2258a7;
+}
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 10px;
+}
+.metric {
+  min-height: 84px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel2);
+}
+.metric .value {
+  font-size: 22px;
+  font-weight: 760;
+  overflow-wrap: anywhere;
+}
+.metric .label {
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.kvs {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 8px 12px;
+  font-size: 12px;
+}
+.kvs .k { color: var(--muted); }
+.quick-list {
+  display: grid;
+  gap: 8px;
+}
+.quick-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel3);
+}
+.quick-row strong {
+  display: block;
+  font-size: 13px;
+}
+.quick-row span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.protocol-bars {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 6px;
+}
+.channel {
+  min-height: 58px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel2);
+}
+.channel.active {
+  border-color: #315f84;
+  background: #122030;
+}
+.channel .ch {
+  color: var(--muted);
+  font-size: 11px;
+}
+.channel .count {
+  margin-top: 4px;
+  font-size: 20px;
+  font-weight: 760;
+}
+.log {
+  height: 300px;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #0a0d12;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.log .info { color: #c9d4e2; }
+.log .warn { color: var(--warn); }
+.log .error { color: var(--bad); }
+.table-wrap { overflow: auto; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+th, td {
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  white-space: nowrap;
+}
+th {
+  color: var(--muted);
+  background: #141922;
+  font-weight: 600;
+}
+pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  color: #c9d4e2;
+}
+.inline-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+}
+.inline-check input {
+  width: auto;
+  height: auto;
+}
+@media (max-width: 1100px) {
+  main { grid-template-columns: 1fr; }
+  .metrics { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 700px) {
+  .grid2, .grid3, .segmented { grid-template-columns: 1fr; }
+  .metrics { grid-template-columns: 1fr; }
+  .protocol-bars { grid-template-columns: repeat(4, 1fr); }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="topbar">
+    <div class="title-block">
+      <h1>Intan RHX Control Console</h1>
+      <div class="subtle">Single-shot stimulation, RHX run-state control, protocol preview, and recording verification.</div>
+    </div>
+    <div class="badges">
+      <span id="statusBadge" class="badge">IDLE</span>
+      <span id="cmdBadge" class="badge">CMD --</span>
+      <span id="modeBadge" class="badge">MODE --</span>
+      <span id="stimBadge" class="badge">STIM LOCKED</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="stack">
+    <div class="panel">
+      <h2>Connection</h2>
+      <div class="body">
+        <div class="grid2">
+          <label>Host
+            <input id="host" value="127.0.0.1">
+          </label>
+          <label>Command Port
+            <input id="commandPort" type="number" value="5000">
+          </label>
+        </div>
+        <div class="actions">
+          <button class="secondary" onclick="checkRhx()">Check Status</button>
+          <button onclick="rhxControl('run')">Run</button>
+          <button class="warn" onclick="rhxControl('record')">Record</button>
+          <button class="secondary" onclick="rhxControl('stop')">Stop</button>
+          <button class="danger" onclick="emergencyStop()">Emergency Stop</button>
+        </div>
+        <pre id="rhxFields">No status check yet.</pre>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Manual Control</h2>
+      <div class="body">
+        <div class="segmented">
+          <button id="presetSingle" class="secondary active" onclick="applyManualPreset('single')">Single</button>
+          <button id="presetRepeat" class="secondary" onclick="applyManualPreset('repeat')">Repeat</button>
+          <button id="presetSweep" class="secondary" onclick="applyManualPreset('sweep')">Multi-Channel</button>
+        </div>
+        <div class="grid2">
+          <label>Channels
+            <input id="manualChannels" value="0" placeholder="0 or 0,1,2">
+          </label>
+          <label>Amplitude uA
+            <input id="manualAmplitude" type="number" value="10" min="0.5" max="50" step="0.5">
+          </label>
+          <label>Phase Duration us
+            <input id="manualPhase" type="number" value="500" min="10" max="5000" step="10">
+          </label>
+          <label>Interphase Delay us
+            <input id="manualInterphase" type="number" value="0" min="0" max="1000" step="10">
+          </label>
+          <label>Pulse Count
+            <input id="manualPulseCount" type="number" value="1" min="1" max="8">
+          </label>
+          <label>Pulse Interval ms
+            <input id="manualPulseInterval" type="number" value="250" min="0" max="2000" step="10">
+          </label>
+          <label>Channel Interval ms
+            <input id="manualChannelInterval" type="number" value="0" min="0" max="1000" step="10">
+          </label>
+          <label>Post Window s
+            <input id="manualPostTrigger" type="number" value="1.0" min="0.2" max="10" step="0.1">
+          </label>
+          <label>Polarity
+            <select id="manualPolarity">
+              <option value="NegativeFirst" selected>Negative First</option>
+              <option value="PositiveFirst">Positive First</option>
+            </select>
+          </label>
+          <label>Waveform
+            <select id="manualWaveform">
+              <option value="Biphasic" selected>Biphasic</option>
+            </select>
+          </label>
+        </div>
+        <label>Live Stim Confirmation
+          <input id="confirmText" placeholder="ENABLE_STIM">
+        </label>
+        <label class="inline-check">
+          <input id="manualRecordToDisk" type="checkbox">
+          Record to disk and verify stim.dat
+        </label>
+        <div class="actions">
+          <button class="secondary" onclick="previewManualPulse()">Preview Manual Protocol</button>
+          <button id="manualPulseBtn" class="danger" onclick="runManualSinglePulse()">Execute Manual Protocol</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Quick Actions</h2>
+      <div class="body quick-list">
+        <div class="quick-row">
+          <div>
+            <strong>Single pulse on current channel</strong>
+            <span>One biphasic pulse with the current manual settings.</span>
+          </div>
+          <button class="secondary" onclick="applyManualPreset('single'); previewManualPulse()">Load</button>
+        </div>
+        <div class="quick-row">
+          <div>
+            <strong>Triplet on one channel</strong>
+            <span>Three pulses, 250 ms apart, for one-site repeat testing.</span>
+          </div>
+          <button class="secondary" onclick="applyManualPreset('repeat'); previewManualPulse()">Load</button>
+        </div>
+        <div class="quick-row">
+          <div>
+            <strong>0-1-2-3 channel sweep</strong>
+            <span>Sequential triggers across four channels with 250 ms spacing.</span>
+          </div>
+          <button class="secondary" onclick="applyManualPreset('sweep'); previewManualPulse()">Load</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Encoded Stim Record</h2>
+      <div class="body">
+        <div class="grid2">
+          <label>Encoding
+            <select id="encoding">
+              <option value="lif" selected>LIF</option>
+              <option value="delayed_phase">Delayed Phase</option>
+              <option value="rate">Rate</option>
+            </select>
+          </label>
+          <label>Digit
+            <input id="digit" type="number" value="0" min="0" max="9">
+          </label>
+          <label>Channels In stim.dat
+            <input id="nChannels" type="number" value="64" min="8" max="128">
+          </label>
+          <label>Post Window s
+            <input id="postTrigger" type="number" value="2.0" min="0.5" max="10" step="0.5">
+          </label>
+        </div>
+        <div class="actions">
+          <button class="secondary" onclick="previewProtocol()">Preview Encoded Protocol</button>
+          <button id="runStimBtn" class="danger" onclick="runSingleStim()">Record + Stim + Verify</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="stack">
+    <div class="metrics">
+      <div class="metric">
+        <div id="metricPulses" class="value">--</div>
+        <div class="label">Protocol Pulses</div>
+      </div>
+      <div class="metric">
+        <div id="metricCharge" class="value">--</div>
+        <div class="label">Total Charge nC</div>
+      </div>
+      <div class="metric">
+        <div id="metricVerified" class="value">--</div>
+        <div class="label">Verified Pulses</div>
+      </div>
+      <div class="metric">
+        <div id="metricRecording" class="value">--</div>
+        <div class="label">Latest Recording</div>
+      </div>
+      <div class="metric">
+        <div id="metricChannels" class="value">--</div>
+        <div class="label">Active Channels</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Current Protocol</h2>
+      <div class="body">
+        <div class="kvs">
+          <div class="k">Mode</div><div id="protoMode">--</div>
+          <div class="k">Channels</div><div id="protoChannels">--</div>
+          <div class="k">Amplitude</div><div id="protoAmplitude">--</div>
+          <div class="k">Timing</div><div id="protoTiming">--</div>
+        </div>
+        <div id="protocolBars" class="protocol-bars"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Latest Verification</h2>
+      <div class="body">
+        <pre id="latestVerification">No verification yet.</pre>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Operation Log</h2>
+      <div class="body">
+        <div id="log" class="log"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Recordings</h2>
+      <div class="body table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>stim.dat</th>
+              <th>amplifier.dat</th>
+              <th>Verified</th>
+              <th>Active Channels</th>
+            </tr>
+          </thead>
+          <tbody id="recordingsBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+let evtSource = null;
+
+function payload() {
+  return {
+    host: document.getElementById('host').value,
+    command_port: parseInt(document.getElementById('commandPort').value, 10),
+    encoding: document.getElementById('encoding').value,
+    digit: parseInt(document.getElementById('digit').value, 10),
+    n_channels: parseInt(document.getElementById('nChannels').value, 10),
+    post_trigger_s: parseFloat(document.getElementById('postTrigger').value),
+    confirm_text: document.getElementById('confirmText').value
+  };
+}
+
+function manualPayload() {
+  return {
+    host: document.getElementById('host').value,
+    command_port: parseInt(document.getElementById('commandPort').value, 10),
+    channels: document.getElementById('manualChannels').value,
+    amplitude_ua: parseFloat(document.getElementById('manualAmplitude').value),
+    phase_duration_us: parseFloat(document.getElementById('manualPhase').value),
+    interphase_delay_us: parseFloat(document.getElementById('manualInterphase').value),
+    polarity: document.getElementById('manualPolarity').value,
+    waveform: document.getElementById('manualWaveform').value,
+    pulse_count: parseInt(document.getElementById('manualPulseCount').value, 10),
+    pulse_interval_ms: parseFloat(document.getElementById('manualPulseInterval').value),
+    channel_interval_ms: parseFloat(document.getElementById('manualChannelInterval').value),
+    n_channels: parseInt(document.getElementById('nChannels').value, 10),
+    post_trigger_s: parseFloat(document.getElementById('manualPostTrigger').value),
+    record_to_disk: document.getElementById('manualRecordToDisk').checked,
+    confirm_text: document.getElementById('confirmText').value
+  };
+}
+
+function addLog(message, level = 'info', time = null) {
+  const log = document.getElementById('log');
+  const row = document.createElement('div');
+  row.className = level;
+  row.textContent = `[${time || new Date().toLocaleTimeString()}] ${message}`;
+  log.appendChild(row);
+  log.scrollTop = log.scrollHeight;
+}
+
+function setBadge(el, text, cls) {
+  const node = document.getElementById(el);
+  node.textContent = text;
+  node.className = 'badge' + (cls ? ' ' + cls : '');
+}
+
+function setPresetButtons(activeId) {
+  ['presetSingle', 'presetRepeat', 'presetSweep'].forEach(id => {
+    const node = document.getElementById(id);
+    node.classList.toggle('active', id === activeId);
+  });
+}
+
+function applyManualPreset(kind) {
+  if (kind === 'single') {
+    document.getElementById('manualChannels').value = '0';
+    document.getElementById('manualPulseCount').value = '1';
+    document.getElementById('manualPulseInterval').value = '250';
+    document.getElementById('manualChannelInterval').value = '0';
+    setPresetButtons('presetSingle');
+  } else if (kind === 'repeat') {
+    document.getElementById('manualChannels').value = '0';
+    document.getElementById('manualPulseCount').value = '3';
+    document.getElementById('manualPulseInterval').value = '250';
+    document.getElementById('manualChannelInterval').value = '0';
+    setPresetButtons('presetRepeat');
+  } else if (kind === 'sweep') {
+    document.getElementById('manualChannels').value = '0,1,2,3';
+    document.getElementById('manualPulseCount').value = '1';
+    document.getElementById('manualPulseInterval').value = '250';
+    document.getElementById('manualChannelInterval').value = '250';
+    setPresetButtons('presetSweep');
+  }
+}
+
+function renderProtocol(p) {
+  if (!p) return;
+  document.getElementById('metricPulses').textContent = p.total_pulses ?? '--';
+  document.getElementById('metricCharge').textContent = p.total_charge_nc ?? '--';
+  const activeChannels = (p.pulses_per_channel || []).filter(x => x > 0).length;
+  document.getElementById('metricChannels').textContent = activeChannels || '--';
+  document.getElementById('protoMode').textContent = p.mode || p.encoding || 'encoded';
+  document.getElementById('protoChannels').textContent =
+    (p.channels && p.channels.length)
+      ? p.channels.map(ch => `A-${String(ch).padStart(3, '0')}`).join(', ')
+      : '--';
+  document.getElementById('protoAmplitude').textContent =
+    p.amplitude_ua ? `${p.amplitude_ua} uA / ${p.phase_duration_us} us` : '--';
+  const timingBits = [];
+  if (p.pulse_count) timingBits.push(`${p.pulse_count}x`);
+  if (p.pulse_interval_ms !== undefined) timingBits.push(`${p.pulse_interval_ms} ms pulse gap`);
+  if (p.channel_interval_ms !== undefined && p.channel_interval_ms > 0) {
+    timingBits.push(`${p.channel_interval_ms} ms channel gap`);
+  }
+  if (p.duration_ms !== undefined) timingBits.push(`${p.duration_ms} ms total`);
+  document.getElementById('protoTiming').textContent = timingBits.join(' | ') || '--';
+
+  const bars = document.getElementById('protocolBars');
+  bars.innerHTML = '';
+  (p.pulses_per_channel || []).forEach((count, ch) => {
+    const div = document.createElement('div');
+    div.className = 'channel' + (count > 0 ? ' active' : '');
+    div.innerHTML = `<div class="ch">A-${String(ch).padStart(3, '0')}</div><div class="count">${count}</div>`;
+    bars.appendChild(div);
+  });
+}
+
+function renderVerification(data) {
+  if (!data) return;
+  const summary = data.stim_summary || data.summary || {};
+  document.getElementById('metricVerified').textContent = summary.total_pulses ?? '--';
+  const rec = data.recording || data;
+  if (rec.name) document.getElementById('metricRecording').textContent = rec.name;
+  document.getElementById('latestVerification').textContent = JSON.stringify(data, null, 2);
+}
+
+async function checkRhx() {
+  addLog('Checking RHX status.');
+  const res = await fetch('/api/rhx/status', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload())
+  });
+  const data = await res.json();
+  if (!data.ok) {
+    addLog(data.error, 'error');
+    document.getElementById('rhxFields').textContent = data.error;
+    return;
+  }
+  document.getElementById('rhxFields').textContent = JSON.stringify(data.fields, null, 2);
+  addLog('RHX status received.');
+  pollStatus();
+}
+
+async function rhxControl(action) {
+  addLog(`Sending RHX action: ${action}.`);
+  const res = await fetch('/api/rhx/control', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      host: document.getElementById('host').value,
+      command_port: parseInt(document.getElementById('commandPort').value, 10),
+      action
+    })
+  });
+  const data = await res.json();
+  if (!data.ok) {
+    addLog(data.error, 'error');
+    return;
+  }
+  addLog(`RHX action complete: ${data.run_mode}.`);
+  pollStatus();
+}
+
+async function previewProtocol() {
+  addLog('Building encoded protocol preview.');
+  const res = await fetch('/api/protocol/preview', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload())
+  });
+  const data = await res.json();
+  if (!data.ok) {
+    addLog(data.error, 'error');
+    return;
+  }
+  renderProtocol(data.protocol);
+  addLog(`Encoded preview: ${data.protocol.total_pulses} pulse(s).`);
+}
+
+async function previewManualPulse() {
+  addLog('Building manual protocol preview.');
+  const res = await fetch('/api/stim/manual_preview', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(manualPayload())
+  });
+  const data = await res.json();
+  if (!data.ok) {
+    addLog(data.error, 'error');
+    return;
+  }
+  renderProtocol(data.protocol);
+  addLog(`Manual preview: ${data.protocol.total_pulses} pulse(s) on ${data.protocol.channels.join(',')}.`);
+}
+
+async function runSingleStim() {
+  if (document.getElementById('confirmText').value !== 'ENABLE_STIM') {
+    addLog('Live stim confirmation is missing.', 'error');
+    return;
+  }
+  document.getElementById('runStimBtn').disabled = true;
+  addLog('Starting Record + Stim + Verify.');
+  const res = await fetch('/api/stim/single_record', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload())
+  });
+  const data = await res.json();
+  if (!data.ok) {
+    addLog(data.error, 'error');
+    document.getElementById('runStimBtn').disabled = false;
+  }
+}
+
+async function runManualSinglePulse() {
+  if (document.getElementById('confirmText').value !== 'ENABLE_STIM') {
+    addLog('Live stim confirmation is missing.', 'error');
+    return;
+  }
+  document.getElementById('manualPulseBtn').disabled = true;
+  addLog('Starting manual control protocol.');
+  const res = await fetch('/api/stim/manual_single_pulse', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(manualPayload())
+  });
+  const data = await res.json();
+  if (!data.ok) {
+    addLog(data.error, 'error');
+    document.getElementById('manualPulseBtn').disabled = false;
+  }
+}
+
+async function emergencyStop() {
+  await fetch('/api/emergency_stop', {method: 'POST'});
+  addLog('Emergency stop requested.', 'error');
+}
+
+async function loadRecordings() {
+  const res = await fetch('/api/recordings?limit=20');
+  const data = await res.json();
+  const body = document.getElementById('recordingsBody');
+  body.innerHTML = '';
+  (data.recordings || []).forEach(r => {
+    const s = r.stim_summary || {};
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${r.name}</td>
+      <td>${r.files['stim.dat'] ?? '--'}</td>
+      <td>${r.files['amplifier.dat'] ?? '--'}</td>
+      <td>${s.verdict || '--'}</td>
+      <td>${(s.active_channels || []).join(', ') || '--'}</td>`;
+    body.appendChild(tr);
+  });
+}
+
+async function pollStatus() {
+  try {
+    const res = await fetch('/api/system_status');
+    const s = await res.json();
+    setBadge('statusBadge', (s.status || 'idle').toUpperCase(), s.status === 'running' ? 'warn' : '');
+    setBadge('cmdBadge', s.tcp_command_connected ? 'CMD OK' : 'CMD --', s.tcp_command_connected ? 'good' : '');
+    setBadge('modeBadge', 'MODE ' + (s.run_mode || '--'), s.run_mode === 'Record' ? 'warn' : (s.run_mode === 'Stop' ? 'good' : ''));
+    setBadge('stimBadge', s.dry_run === false ? 'LIVE STIM' : 'STIM LOCKED', s.dry_run === false ? 'bad' : '');
+    if (s.latest_protocol) renderProtocol(s.latest_protocol);
+    if (s.latest_recording) renderVerification(s.latest_recording);
+  } catch (e) {}
+}
+
+function connectSSE() {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource('/stream');
+  evtSource.addEventListener('operation_start', () => {
+    document.getElementById('runStimBtn').disabled = true;
+    document.getElementById('manualPulseBtn').disabled = true;
+  });
+  evtSource.addEventListener('operation_log', e => {
+    const d = JSON.parse(e.data);
+    addLog(d.message, d.level, d.time);
+  });
+  evtSource.addEventListener('protocol', e => {
+    renderProtocol(JSON.parse(e.data));
+  });
+  evtSource.addEventListener('timing', e => {
+    const d = JSON.parse(e.data);
+    addLog(`Timing A-${String(d.channel).padStart(3, '0')} drift ${d.drift_ms} ms.`);
+  });
+  evtSource.addEventListener('operation_done', e => {
+    const d = JSON.parse(e.data);
+    renderVerification(d);
+    document.getElementById('runStimBtn').disabled = false;
+    document.getElementById('manualPulseBtn').disabled = false;
+    addLog('Operation complete.', 'info');
+    loadRecordings();
+  });
+  evtSource.addEventListener('operation_error', e => {
+    const d = JSON.parse(e.data);
+    document.getElementById('runStimBtn').disabled = false;
+    document.getElementById('manualPulseBtn').disabled = false;
+    addLog(d.message, 'error');
+  });
+}
+
+applyManualPreset('single');
+connectSSE();
+previewManualPulse();
+pollStatus();
+loadRecordings();
+setInterval(pollStatus, 1500);
+setInterval(loadRecordings, 5000);
+</script>
+</body>
+</html>
