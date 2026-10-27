@@ -2,6 +2,44 @@
 
 Run from the repository root. The user's Windows baseline passed all 201 existing tests.
 
+## 真正连接正在运行的 RHX Demo（不是 pytest）
+
+```powershell
+python experiments/rhx_tcp_bench.py --demo --seconds 10 --out data/rhx_tcp01
+```
+
+操作：选择 RHS Stimulation/Recording 的 Demo，采样率 30 kS/s、电流步长 0.5 µA；
+设置并应用 spike 阈值（可沿用负向 4 RMS），随后保持 Stop。
+在 Network → Remote TCP Control 打开 Commands 5000、Waveform Output 5001、Spike Output 5002，
+三个服务均为 Pending，关闭其他占用这些服务的客户端，再执行上面的命令。
+程序自行配置 A-000 的三个 10 µA、500 µs/phase 双相脉冲（0/500/1000 ms），
+开启 Run 并持续读取 A-000 STIM 和 A-000/A-001 spike，结束后 Stop。
+准备和逐项回读输出配置可能需要一些时间。
+
+这是通过 TCP 连接用户实际运行的 RHX 软件；没有模拟服务器和失败后的替代数据。
+关闭 RHX 后，用新输出目录再次执行，必须报告 FAILED / connected=false 并返回非零退出码。
+该入口仅允许 Synthetic=True 的 RHS Demo，在任何配置写入前拒绝真实硬件及其他 controller。
+
+关键限制：固定官方源码 3.5.2 的
+`Engine/API/Synthetic/syntheticrhxcontroller.h::setManualStimTrigger` 是空实现；
+`synthdatablockgenerator.cpp` 生成的 stim on/off 和 polarity 均为零。
+因此命令上传/回读/触发未报错，不等于 Demo 产生了脉冲，也不会产生对应的生物诱发响应。
+不要为获得 MATCH 而向原始数据添加假 marker。
+
+观察每秒 RECEIVING 的 blocks/spikes 计数，以及最终 `session.json`：
+
+- `connected=true`、`triggers_sent=3`、`waveform_blocks>0`、`spike_events>0`、
+  `stop_confirmed=true` 时为 `DEMO_TCP_OK`，只表示软件 TCP 配置、触发命令和读取完成。
+- 官方 Demo 通常为 `stim_markers=0`、
+  `stim_record=NOT_VERIFIED_DEMO_DOES_NOT_SIMULATE_STIM`，不能写成刺激验收通过。
+- 无 spike 时为 `DEMO_TCP_NO_SPIKES`，返回非零；先检查阈值、输出通道及运行时长。
+- 真实读取的 `markers.raw`、`spikes.raw`、spike 事件及命令调度报告均保存到指定的新目录。
+- 本入口不测试分类，不输出机械臂命令。真实电流及诱发响应仍需在实机负载/组织条件下验证。
+
+开发验证：79 项相关软件回归通过，含关闭真实本地 TCP 端口时连接失败、拒绝硬件配置写入、
+有/无数字刺激记录时的报告区分。还单独执行了 CLI 的关闭端口检查，确认非零退出且没有替代数据。
+尚未在开发环境启动 RHX 桌面软件进行 GUI/TCP 实测，需用户按上述步骤运行本地 RHX 完成。
+
 ## 1. Stimulation commands and response reading together (no lab hardware)
 
 ```powershell
