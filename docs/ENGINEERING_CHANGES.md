@@ -139,3 +139,18 @@ remain pending; see the linked review for source pages and acceptance requiremen
 所有验证仍为离线软件验证，未进行实机实验；最新测试数量以本轮提交说明为准。
 
 本轮验证：**200 offline tests passed**, including 50 new tests; standalone CLI demo and raw replay passed.
+
+## 6. Socket-fixture acquisition clock regression
+
+复测在高负载运行环境下得到 199 passed / 1 failed：正常并发采集测试的 Python 模拟源
+每次循环只生成一个数据块，可能无法追上独立硬件时钟应有的采样进度，触发实机后端的
+source-clock lag 检查。该次失败会话明确记为 FAILED，没有继续正常分类或控制。
+
+测试模拟源现在按经过的采样时间批量生成全部到期的数据块；触发时刻也使用独立于
+输出线程发送进度的源时钟。另增加确定性的故障注入，验证“数据刚到达、采样仍推进，
+但源时间已落后过多”的情形仍被拒绝。生产发送、接收、分类代码及实机时延界限没有修改。
+
+This change corrects the socket-test producer's clock model and retains the production lag guard.
+It does not establish physical RHX delivery, transport bounds or biological decoding accuracy.
+
+修正后全套回归：**201 passed**（68.57 s），包含新增的确定性源时钟积压检验。

@@ -6,6 +6,7 @@ import socket
 import struct
 import threading
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -14,6 +15,7 @@ from encoders.stimulus_schema import Pulse, StimulusProtocol
 from experiments.openloop_backend import NEURAL_GLOBALS, RHXBackend, encode_marker_bytes
 from experiments.openloop_data import FeatureSpec, FrozenDecoder
 from experiments.openloop_engine import InputTrial, run_session
+from intan_interface.marker_stream import MarkerBlock
 from intan_interface.spike_stream import SPIKE_MAGIC, SpikeStreamError
 from intan_interface.tcp_client import IntanTCPClient
 from tests.test_rhx_session import FakeRHXSocket
@@ -31,6 +33,7 @@ class SocketPairRHX(IntanTCPClient):
         self.thread = None
         self.stop_producer = threading.Event()
         self.drop_trigger = False
+        self.clock_origin = None
 
     def connect_command(self, *args, **kwargs):
         sock = FakeRHXSocket()
@@ -49,7 +52,11 @@ class SocketPairRHX(IntanTCPClient):
             original(data)
             if data.startswith(b"Execute ManualStimTriggerPulse") and not self.drop_trigger:
                 key = data.decode().split()[-1].rstrip(";").lower()
-                self.triggers.put((self.sample + 128, key))
+                # A hardware trigger is dated by the acquisition clock, even
+                # when the fake output thread has not yet flushed older data.
+                now_sample = int((time.monotonic() - self.clock_origin) * 30000)
+                onset = (max(self.sample, now_sample) // 128 + 1) * 128
+                self.triggers.put((onset, key))
 
         sock.sendall = send
         self._command_socket = sock
@@ -65,13 +72,18 @@ class SocketPairRHX(IntanTCPClient):
 
     def record(self, verify=False):
         result = super().record(verify=verify)
+        self.clock_origin = time.monotonic()
         self.thread = threading.Thread(target=self._produce, daemon=True)
         self.thread.start()
         return result
 
     def _produce(self):
         active = []
-        origin = time.monotonic()
+        # Real hardware keeps sampling independently of Python scheduling.
+        # Flush every elapsed block in one batch instead of making source
+        # time advance by only one block per Python loop under runner load.
+        names = sorted(k.split(".")[0].upper() for k, v in self._command_socket.values.items()
+                       if k.endswith(".tcpdataoutputenabledstim") and v.lower() == "true")
         while not self.stop_producer.is_set():
             while True:
                 try:
@@ -81,17 +93,17 @@ class SocketPairRHX(IntanTCPClient):
                                    round(gap * .03), polarity == "NegativeFirst"))
                 except queue.Empty:
                     break
-            names = sorted(k.split(".")[0].upper() for k, v in self._command_socket.values.items()
-                           if k.endswith(".tcpdataoutputenabledstim") and v.lower() == "true")
-            words = np.zeros((128, len(names)), dtype="<u2")
+            elapsed_samples = int((time.monotonic() - self.clock_origin) * 30000)
+            end = max(self.sample + 128, (elapsed_samples // 128 + 1) * 128)
+            words = np.zeros((end - self.sample, len(names)), dtype="<u2")
+            ts = np.arange(self.sample, end)
             spikes = []
             for onset, ch, amp, phase, gap, negative in active:
                 col = names.index(f"A-{ch:03d}")
-                ts = np.arange(self.sample, self.sample + 128)
                 words[(ts >= onset) & (ts < onset + phase), col] = amp | (0x100 if negative else 0)
                 words[(ts >= onset + phase + gap) & (ts < onset + phase * 2 + gap), col] = amp | (0 if negative else 0x100)
                 response = onset + phase * 2 + gap + 120
-                if self.sample <= response < self.sample + 128:
+                if self.sample <= response < end:
                     spikes.append(SPIKE_MAGIC + b"A-000" + struct.pack("<I", response) + b"\x40")
             try:
                 self.marker_tx.sendall(encode_marker_bytes(self.sample, words))
@@ -99,9 +111,9 @@ class SocketPairRHX(IntanTCPClient):
                     self.spike_tx.sendall(b"".join(spikes))
             except OSError:
                 return
-            self.sample += 128
+            self.sample = end
             active = [p for p in active if p[0] + p[3] * 2 + p[4] + 120 >= self.sample]
-            self.stop_producer.wait(max(0, origin + self.sample / 30000 - time.monotonic()))
+            self.stop_producer.wait(.02)
 
     def stop(self, verify=False):
         result = super().stop(verify=verify)
@@ -157,6 +169,21 @@ def test_missing_stim_marker_fails_session_instead_of_decoding_zeros(tmp_path):
     meta = json.loads((tmp_path / "failed" / "session.json").read_text())
     assert meta["status"] == "FAILED" and meta["processed_trials"] == 0
     assert not meta["arm_tasks"]
+
+
+def test_advancing_marker_data_cannot_hide_excessive_source_clock_lag(tmp_path):
+    b = backend(tmp_path, ["A-000"], "lag-test")
+    b.rate = 30000
+    b.metadata["max_observed_clock_lag_ms"] = 0
+    received = time.monotonic_ns()
+    b._record_host_ns = received - int((TIMING["max_stream_age_ms"] + 100) * 1e6)
+    block = MarkerBlock(0, np.zeros((128, 1), dtype="<u2"), received)
+    b.marker_reader = SimpleNamespace(drain=lambda: [block])
+    # Bytes have just arrived and samples advance, but their acquisition time
+    # is already too old. Keep this fault check independent of runner speed.
+    with pytest.raises(SpikeStreamError, match="clock fell behind"):
+        b._drain_once()
+    assert b.metadata["max_observed_clock_lag_ms"] > TIMING["max_stream_age_ms"]
 
 
 def test_late_spike_invalidates_closed_window_and_invokes_fault_stop(tmp_path):
