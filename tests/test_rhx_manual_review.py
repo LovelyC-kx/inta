@@ -51,13 +51,14 @@ def test_all_legacy_output_routes_are_disabled_and_read_back(expander, analog, d
     sock = c._command_socket
     sock.values["expanderconnected"] = str(expander)
     sock.values["analog-out-1.stimenabled"] = "true"
-    sock.values["digital-out-1.stimenabled"] = "true"
+    sock.values["digital-out-01.stimenabled"] = "true"
     c.prepare_protocols([protocol()])
     sent = b"".join(sock.sent)
     for prefix, count in [("ANALOG-OUT", analog), ("DIGITAL-OUT", digital)]:
         for ch in range(1, count + 1):
-            assert f"Set {prefix}-{ch}.stimenabled false;".encode() in sent
-            assert f"Get {prefix}-{ch}.stimenabled;".encode() in sent
+            name = f"{prefix}-{ch:02d}" if prefix == "DIGITAL-OUT" else f"{prefix}-{ch}"
+            assert f"Set {name}.stimenabled false;".encode() in sent
+            assert f"Get {name}.stimenabled;".encode() in sent
     assert c.prepared_session["hardware"]["synthetic"] is True
     assert c.prepared_session["physical_delivery_verified"] is False
 
@@ -72,6 +73,26 @@ def test_silent_analog_disable_drop_prevents_upload():
         c.prepare_protocols([protocol()])
     assert b"Execute UploadStimParameters;" not in sock.sent
     assert not c._prepared_profiles
+
+
+def test_silent_digital_disable_drop_still_prevents_upload():
+    c = client()
+    sock = c._command_socket
+    sock.values["digital-out-01.stimenabled"] = "true"
+    send = sock.sendall
+    sock.sendall = lambda data: None if data == b"Set DIGITAL-OUT-01.stimenabled false;" else send(data)
+    with pytest.raises(RuntimeError, match="DIGITAL-OUT-01.stimenabled=.*expected false"):
+        c.prepare_protocols([protocol()])
+    assert b"Execute UploadStimParameters;" not in sock.sent
+    assert not c._prepared_profiles
+
+
+@pytest.mark.parametrize("name", ["DIGITAL-OUT-1", "DIGITAL-IN-1"])
+def test_controller_fixture_rejects_unpadded_digital_native_names(name):
+    from intan_interface.command_channel import RHXCommandError
+    c = client()
+    with pytest.raises(RHXCommandError, match="two digits"):
+        c.get(f"{name}.StimEnabled")
 
 
 def test_settle_recovery_and_train_period_do_not_inherit_gui_values():

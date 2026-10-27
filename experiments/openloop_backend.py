@@ -260,7 +260,7 @@ class RHXBackend:
             limit = 16 if self.hardware.expander_connected else 2
             if not 0 <= self.ttl_bit < limit:
                 raise ValueError("TTL input bit is absent from this controller/expander inventory")
-            self._set_checked(f"DIGITAL-IN-{self.ttl_bit + 1}.TCPDataOutputEnabled", "True")
+            self._set_checked(f"DIGITAL-IN-{self.ttl_bit + 1:02d}.TCPDataOutputEnabled", "True")
         # Verify that no old amplifier payload changes the declared word layout.
         for port in "ABCD":
             count = int(c._get_value(f"{port}.NumberAmplifierChannels"))

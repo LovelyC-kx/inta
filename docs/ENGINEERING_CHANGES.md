@@ -154,3 +154,20 @@ This change corrects the socket-test producer's clock model and retains the prod
 It does not establish physical RHX delivery, transport bounds or biological decoding accuracy.
 
 修正后全套回归：**201 passed**（68.57 s），包含新增的确定性源时钟积压检验。
+
+## 7. Digital native names from the user's actual RHX 3.5.0 bench
+
+用户真实 TCP 联调已连上 RHX 3.5.0 RHS Demo，但在任何触发和数据采集之前，
+输出禁用回读于 DIGITAL-OUT-1 失败。复核 TCP Guide 和官方
+`AbstractRHXController::getDigitalIOChannelNumber`：数字通道使用两位编号 01..16，
+模拟通道保持一位编号 1..8。之前客户端与过于宽松的测试模拟器均用了错误数字名称。
+
+- 数字输出改为 DIGITAL-OUT-01..16；可选 TTL 改为 DIGITAL-IN-01..16。
+- 继续验证每个路由已禁用；不跳过数字路由、不放宽实机检查。
+- 不一致错误现在保留实际回读值及期望值，便于进一步定位。
+- 模拟器拒绝不补零的数字通道名称，并测试数字禁用命令丢失时依旧阻止上传。
+- 补充可选 TTL native name 检验。该修正仍需用户重新运行实际 RHX 完成现场复验。
+
+失败输出目录保留诊断记录，下一次必须使用新目录（如 data/rhx_tcp02），不会覆盖旧实验。
+
+修正后全套离线回归：**213 passed**（95.89 s）。实际 RHX 修正后的联调结果待用户复验。

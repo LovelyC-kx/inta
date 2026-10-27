@@ -1,5 +1,6 @@
 """Protocol/transport regressions using a fake RHX, never laboratory hardware."""
 import socket
+import re
 
 import pytest
 
@@ -38,6 +39,11 @@ class FakeRHXSocket:
             if not cmd:
                 continue
             words = cmd.split()
+            if len(words) > 1 and words[1].lower().startswith(("digital-in-", "digital-out-")):
+                name = words[1].split(".")[0].lower()
+                if not re.fullmatch(r"digital-(?:in|out)-(?:0[1-9]|1[0-6])", name):
+                    self.pending.extend(b"Error: Unrecognized digital native channel; use two digits")
+                    continue
             if words[0].lower() == "set":
                 if words[1].lower() == "runmode":
                     current = self.values["runmode"]

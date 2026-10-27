@@ -680,7 +680,9 @@ class IntanTCPClient:
                     disabled_channels.append(f"{port}-{ch:03d}")
             for port, count in (("ANALOG-OUT", 8 if hardware.expander_connected else 2),
                                 ("DIGITAL-OUT", 16 if hardware.expander_connected else 2)):
-                disabled_channels.extend(f"{port}-{ch}" for ch in range(1, count + 1))
+                # RHS analog ports use 1..8; digital native names use 01..16.
+                disabled_channels.extend(f"{port}-{ch:02d}" if port == "DIGITAL-OUT" else f"{port}-{ch}"
+                                         for ch in range(1, count + 1))
             for name in disabled_channels:
                 self.set(f"{name}.stimenabled", "false")
                 time.sleep(self.INTER_COMMAND_DELAY_S)
@@ -710,8 +712,9 @@ class IntanTCPClient:
             active_names = {f"{channel_prefix}-{p.channel:03d}" for p in protocol.pulses}
             for name in disabled_channels:
                 expected = "true" if name in active_names else "false"
-                if self.get(f"{name}.stimenabled").split()[-1].lower() != expected:
-                    raise RuntimeError(f"RHX profile mismatch: {name}.stimenabled")
+                actual = self._get_value(f"{name}.stimenabled")
+                if actual.casefold() != expected:
+                    raise RuntimeError(f"RHX profile mismatch: {name}.stimenabled={actual!r}, expected {expected}")
             if active_names - set(disabled_channels):
                 raise RuntimeError("A requested stimulation channel is absent from the RHS inventory")
             # Only a complete, verified software profile may be uploaded.

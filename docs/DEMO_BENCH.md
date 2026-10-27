@@ -16,6 +16,11 @@ python experiments/rhx_tcp_bench.py --demo --seconds 10 --out data/rhx_tcp01
 开启 Run 并持续读取 A-000 STIM 和 A-000/A-001 spike，结束后 Stop。
 准备和逐项回读输出配置可能需要一些时间。
 
+数字端口 native names 必须补零（DIGITAL-OUT-01、DIGITAL-IN-01），模拟端口仍为
+ANALOG-OUT-1。若旧版报 DIGITAL-OUT-1 的回读错误，请更新 intan_interface/tcp_client.py；
+可选 TTL 修正位于 experiments/openloop_backend.py。失败目录保留原始诊断记录，重跑使用
+新的 --out（如 data/rhx_tcp02），不要覆盖此前的输出。
+
 这是通过 TCP 连接用户实际运行的 RHX 软件；没有模拟服务器和失败后的替代数据。
 关闭 RHX 后，用新输出目录再次执行，必须报告 FAILED / connected=false 并返回非零退出码。
 该入口仅允许 Synthetic=True 的 RHS Demo，在任何配置写入前拒绝真实硬件及其他 controller。

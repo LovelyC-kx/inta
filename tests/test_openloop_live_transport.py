@@ -186,6 +186,17 @@ def test_advancing_marker_data_cannot_hide_excessive_source_clock_lag(tmp_path):
     assert b.metadata["max_observed_clock_lag_ms"] > TIMING["max_stream_age_ms"]
 
 
+def test_optional_ttl_uses_padded_native_digital_input_name(tmp_path):
+    b = backend(tmp_path, ["A-000"], "ttl-native-name")
+    b.ttl_bit = 0
+    try:
+        b.prepare([StimulusProtocol([Pulse(0, 0)], 8, 200)], FeatureSpec(duration_ms=60, n_bins=6))
+        assert b.client._command_socket.values["digital-in-01.tcpdataoutputenabled"] == "True"
+        assert b.marker_parser.digital_in and b.marker_parser.n_words == 2
+    finally:
+        b.close()
+
+
 def test_late_spike_invalidates_closed_window_and_invokes_fault_stop(tmp_path):
     b = backend(tmp_path, ["A-000"], "test-epoch")
     proto = StimulusProtocol([Pulse(0, 0)], 8, 200)
