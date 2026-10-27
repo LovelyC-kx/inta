@@ -140,12 +140,13 @@ class SpikeStreamReader:
                     continue
                 if not data:
                     raise SpikeStreamError("RHX spike socket closed (EOF)")
+                host_rx_ns = time.monotonic_ns()
                 self.raw_bytes += len(data)
                 if self.raw_sink is not None:
                     count = self.raw_sink.write(data)
                     if count is not None and count != len(data):
                         raise SpikeStreamError("Incomplete raw spike journal write")
-                events = self.parser.feed(data)
+                events = self.parser.feed(data, host_rx_ns=host_rx_ns)
                 if self.parser.discarded_bytes or self.parser.malformed_packets:
                     raise SpikeStreamError("Corrupt/misaligned spike bytes; raw journal retained")
                 for event in events:

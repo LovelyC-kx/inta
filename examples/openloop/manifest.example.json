@@ -1,0 +1,10 @@
+{
+  "trials": [
+    {"trial_id": "train-0-1", "image": "../../data/images/digit0_train.png", "label": "0", "group": "training"},
+    {"trial_id": "train-1-1", "image": "../../data/images/digit1_train.png", "label": "1", "group": "training"},
+    {"trial_id": "train-7-1", "image": "../../data/images/digit7_train.png", "label": "7", "group": "training"},
+    {"trial_id": "test-0-1", "image": "../../data/images/digit0_test.png", "label": "0", "group": "heldout"},
+    {"trial_id": "test-1-1", "image": "../../data/images/digit1_test.png", "label": "1", "group": "heldout"},
+    {"trial_id": "test-7-1", "image": "../../data/images/digit7_test.png", "label": "7", "group": "heldout"}
+  ]
+}

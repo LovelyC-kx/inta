@@ -196,4 +196,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    print("Legacy stimulation entry retired. Use frontend/app.py or experiments/run_openloop.py.", file=sys.stderr)
+    raise SystemExit(2)

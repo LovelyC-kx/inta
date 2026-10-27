@@ -1,0 +1,7 @@
+{
+  "max_cross_socket_delay_ms": 200,
+  "max_stream_age_ms": 1000,
+  "max_schedule_error_ms": 100,
+  "validated": false,
+  "evidence": "UNMEASURED EXAMPLE: replace bounds and this note with your bench measurements before enabling physical arm output."
+}

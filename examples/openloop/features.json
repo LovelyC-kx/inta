@@ -1,0 +1,8 @@
+{
+  "duration_ms": 2500,
+  "offset_ms": 0,
+  "pre_blank_ms": 1,
+  "post_blank_ms": 10,
+  "n_bins": 50,
+  "min_valid_fraction": 0.2
+}

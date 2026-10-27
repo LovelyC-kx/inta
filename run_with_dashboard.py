@@ -157,4 +157,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    print("Legacy experiment launcher retired. Use python experiments/run_openloop.py --help; "
+          "python frontend/app.py remains the single-stimulation dashboard.", file=sys.stderr)
+    raise SystemExit(2)

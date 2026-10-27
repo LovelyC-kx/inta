@@ -704,4 +704,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    print("Legacy waveform classification entry retired. Use: python experiments/run_openloop.py --help", file=sys.stderr)
+    raise SystemExit(2)

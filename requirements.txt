@@ -5,3 +5,4 @@ torch>=2.5
 torchvision>=0.20
 Flask>=3.0
 pyserial>=3.5
+Pillow>=10.0

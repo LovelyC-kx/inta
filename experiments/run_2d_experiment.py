@@ -471,6 +471,9 @@ def main():
                              "(default 300 = 5 min). Use shorter for dry-run.")
     args = parser.parse_args()
 
+    if args.phase != "baseline":
+        parser.error("Legacy probe/classify stimulation paths retired; use experiments/run_openloop.py collect/run")
+
     config = DEFAULT_CONFIG.copy()
     config["host"] = args.host
     config["command_port"] = args.cmd_port

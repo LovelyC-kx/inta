@@ -116,3 +116,26 @@ integrity checks, and recording metadata binding. Typed STIM/TTL alignment and r
 remain pending; see the linked review for source pages and acceptance requirements.
 
 验证 / Validation: **150 offline tests passed**, including 35 new regressions; no hardware test.
+
+## 5. Continuous open-loop owner
+
+新增统一入口 [run_openloop.py](../experiments/run_openloop.py)，启动说明见 [OPENLOOP.md](OPENLOOP.md)。
+
+- 任意 PIL 图片/二维 numpy 灰度图通过清单进入同一 CNN/编码器；实际刺激参数先覆盖、再按电荷裁剪。
+- 5001 typed STIM/可选TTL、5002原生RHX spike独立接收；公共收集线程持续推进，刺激和机械臂不会占用接收线程。
+- 数字脉冲各相与预装profile核对；按真实marker取窗口并应用逐脉冲遮罩。
+- 采集、LR/MLP训练、冻结JSON模型、真实推理和原始字节回放使用同一特征契约。
+- 明确组别留出，scaler/模型仅拟合训练集；保留字符串类别，不再混淆数字标签和输出下标。
+- 机械臂任务单独线程运行，支持动作序列及置信度/忙碌/重复/过期拒绝；故障可取消执行中任务。
+- 组织编号、CNN hash、刺激profile/端口、通道顺序、采样率、RHX检测设置和特征窗口均参与模型匹配。
+- 模拟模型不能用于物理后端；实机机械臂还要求当前与训练数据具有明确的时序测量声明。
+- 单个新输入只使用部分通道时仍预装训练profile bank，配置行不会被额外执行。
+- 原生5002无逐块心跳，因此实机采用显式cross-socket holdback假设；迟到事件、积压/停滞、
+  marker不符或断连会使会话失败。不能将该假设写成硬件已经提供完成证明。
+- 旧实时/图片刺激CLI已停用并指向新入口；浏览器连续实验控制和行为结果反馈尚未加入。
+
+完整模拟演练已走通图片→原始字节→训练/测试→冻结推理→机械臂模拟→原始回放。
+真实后端的socketpair/fake RHX测试包含持续接收、marker缺失、spike迟到/断连、流停滞和任务适配。
+所有验证仍为离线软件验证，未进行实机实验；最新测试数量以本轮提交说明为准。
+
+本轮验证：**200 offline tests passed**, including 50 new tests; standalone CLI demo and raw replay passed.

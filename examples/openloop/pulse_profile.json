@@ -1,0 +1,7 @@
+{
+  "amplitude_ua": 10,
+  "phase_duration_us": 500,
+  "interphase_delay_us": 0,
+  "polarity": "NegativeFirst",
+  "waveform": "Biphasic"
+}
