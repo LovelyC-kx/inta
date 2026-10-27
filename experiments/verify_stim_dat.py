@@ -1,9 +1,9 @@
 """
-Verify that stimulation actually happened by analyzing RHX-recorded stim.dat.
+Analyze the digital stimulation record in RHX stim.dat.
 
-RHX writes one int16 per sample per stim-capable channel to stim.dat. A
-non-zero value means current was flowing at that sample. Rising edges mark
-pulse onsets.
+Each little-endian uint16 contains magnitude, polarity, and status flags.
+Status-only nonzero words do not indicate current. A two-phase digital record
+does not by itself verify electrode current or physical delivery.
 
 Usage:
   python experiments/verify_stim_dat.py --data-dir data/test_<rhx_ts>/
@@ -122,7 +122,8 @@ def estimate_charge_per_pulse(stim_ch, onset_idx, sample_rate=30000, stim_step_u
     raise ValueError("onset_idx is not a complete biphasic pulse")
 
 
-def summarize(data_dir, n_channels=64, n_stim_channels=8, plot=True, stim_step_ua=None):
+def summarize(data_dir, n_channels=64, n_stim_channels=8, plot=True, stim_step_ua=None,
+              sample_rate_hz=None):
     data_dir = Path(data_dir)
     config = {}
     cfg_path = data_dir / "config.json"
@@ -134,9 +135,15 @@ def summarize(data_dir, n_channels=64, n_stim_channels=8, plot=True, stim_step_u
     print(f"Loading {data_dir}/stim.dat ...")
     stim = load_stim_dat(data_dir, n_channels)
     n_samples = stim.shape[1]
-    sample_rate = config.get("sample_rate_hz", 30000)
+    if (sample_rate_hz is not None and "sample_rate_hz" in config and
+            sample_rate_hz != config["sample_rate_hz"]):
+        raise ValueError("Session and recording config disagree on sample_rate_hz")
+    sample_rate = sample_rate_hz if sample_rate_hz is not None else config.get("sample_rate_hz", 30000)
     if not np.isfinite(sample_rate) or sample_rate <= 0:
         raise ValueError("Invalid sample rate")
+    if (stim_step_ua is not None and "stim_step_ua" in config and
+            stim_step_ua != config["stim_step_ua"]):
+        raise ValueError("Session and recording config disagree on stim_step_ua")
     stim_step_ua = stim_step_ua if stim_step_ua is not None else config.get("stim_step_ua")
     if stim_step_ua is not None and (not np.isfinite(stim_step_ua) or stim_step_ua <= 0):
         raise ValueError("Invalid stim_step_ua")
@@ -168,6 +175,13 @@ def summarize(data_dir, n_channels=64, n_stim_channels=8, plot=True, stim_step_u
             raise ValueError("time.dat and stim.dat sample counts do not match")
         if n_samples:
             times = np.memmap(time_path, mode="r", dtype="<u4")
+            previous = None
+            for start in range(0, n_samples, 65536):
+                block = times[start:start + 65536]
+                if (np.any(np.diff(block) != 1) or (previous is not None and
+                        int(block[0]) != ((previous + 1) & 0xffffffff))):
+                    raise ValueError("time.dat timestamp gap/reset; contiguous recording required")
+                previous = int(block[-1])
             for pulses in pulse_records.values():
                 for pulse in pulses:
                     pulse["raw_rhx_timestamp"] = int(times[pulse["onset_sample"]])

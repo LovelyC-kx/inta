@@ -42,3 +42,17 @@ def test_emergency_stop_cancels_the_shared_scheduler():
         assert stim_cancel_event.is_set()
     finally:
         stim_cancel_event.clear()
+
+
+def test_new_recording_uses_queried_hardware_rate_and_step(tmp_path):
+    import json
+    from frontend.app import _analyze_session_recording
+    from tests.test_stim_recording import bipolar
+    bipolar().astype("<u2").tofile(tmp_path / "stim.dat")
+    session = {"hardware": {"sample_rate_hz": 20000, "stim_step_ua": .5},
+               "physical_delivery_verified": False}
+    result = _analyze_session_recording(tmp_path, 1, session, {"total_pulses": 1}, [])
+    assert result["sample_rate_hz"] == 20000
+    assert result["pulse_records"][0][0]["absolute_charge_nc_from_codes"] == 15
+    assert result["verdict"] == "STIM_RECORDED_COUNT_MATCH"
+    assert json.loads((tmp_path / "rhx_session.json").read_text()) == session

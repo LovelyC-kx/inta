@@ -3,9 +3,8 @@ Verify the WaveformFrameReader against synthetic frames matching the
 verified Intan RHX waveform stream format.
 
 Format (verified from real RHS Demo TCP capture):
-    [4-byte stream header (one-time)]
-    [frame_0: 4B timestamp(LE u32) + n_ch*2B samples(LE u16, offset-binary)]
-    [frame_1: ...]
+    Repeating [4-byte magic + 128 frames], with each frame containing
+    a 4B timestamp(LE u32) + n_ch*2B amplifier samples(LE u16, offset-binary).
     ...
 
 Conversion: uv = (uint16 - 32768) * 0.195

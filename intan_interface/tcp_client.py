@@ -28,11 +28,14 @@ import socket
 import struct
 import threading
 import time
+import math
+from numbers import Integral
 from collections import deque
 import numpy as np
 from typing import Optional
 
-from .command_channel import receive_fenced_reply, validate_command
+from .command_channel import RHXCommandError, receive_fenced_reply, validate_command
+from .hardware_profile import RHSProfile, rhx_bool
 
 
 # ── Verified Intan waveform stream format constants ────────────
@@ -51,6 +54,11 @@ WAVEFORM_TIMESTAMP_BYTES = 4
 WAVEFORM_SAMPLE_BYTES = 2            # uint16 per sample per channel
 AMPLIFIER_UV_PER_BIT = 0.195
 AMPLIFIER_OFFSET_BINARY_ZERO = 32768 # 0x8000
+WAVEFORM_MAGIC = struct.pack("<I", 0x2ef07a08)
+
+
+class WaveformStreamError(RuntimeError):
+    """Waveform framing/continuity failed; do not decode this acquisition."""
 
 
 class WaveformFrameReader:
@@ -66,7 +74,7 @@ class WaveformFrameReader:
 
     The parser:
         1. Accumulates raw TCP bytes
-        2. Parses complete blocks (skipping block headers)
+        2. Validates magic and timestamp continuity, then parses complete blocks
         3. Stores parsed frames in an internal buffer
         4. read_frames(n) returns n frames from the parsed buffer
 
@@ -80,6 +88,10 @@ class WaveformFrameReader:
 
     def __init__(self, n_channels, block_size=SAMPLES_PER_BLOCK,
                  block_header_size=BLOCK_HEADER_SIZE):
+        if isinstance(n_channels, bool) or not isinstance(n_channels, Integral) or n_channels < 1:
+            raise ValueError("n_channels must be a positive integer")
+        if block_size != SAMPLES_PER_BLOCK or block_header_size != BLOCK_HEADER_SIZE:
+            raise ValueError("RHX TCP requires 128-frame blocks with a 4-byte magic")
         self.n_channels = n_channels
         self.frame_bytes = WAVEFORM_TIMESTAMP_BYTES + n_channels * WAVEFORM_SAMPLE_BYTES
         self.block_size = block_size
@@ -90,11 +102,22 @@ class WaveformFrameReader:
         self._parsed_ts = []    # list of uint32 arrays
         self._parsed_uv = []    # list of (n_ch, n_frames) float32 arrays
         self._total_parsed = 0
+        self._last_timestamp = None
+        self._error = None
 
     def add_data(self, data):
         """Append raw bytes received from the waveform socket."""
+        self._raise_if_failed()
         self._raw_buffer.extend(data)
-        self._parse_available_blocks()
+        try:
+            self._parse_available_blocks()
+        except WaveformStreamError as exc:
+            self._error = exc
+            raise
+
+    def _raise_if_failed(self):
+        if self._error is not None:
+            raise self._error
 
     def reset(self):
         """Reset all state. Call when reconnecting."""
@@ -102,11 +125,15 @@ class WaveformFrameReader:
         self._parsed_ts.clear()
         self._parsed_uv.clear()
         self._total_parsed = 0
+        self._last_timestamp = None
+        self._error = None
 
     def _parse_available_blocks(self):
         """Parse as many complete blocks as possible from the raw buffer."""
         while len(self._raw_buffer) >= self.block_total_bytes:
-            # Skip block header
+            if self._raw_buffer[:self.block_header_size] != WAVEFORM_MAGIC:
+                raise WaveformStreamError("Invalid RHX waveform magic; check stream layout/alignment")
+            # Validate every block; never skip arbitrary bytes as a header.
             del self._raw_buffer[:self.block_header_size]
 
             # Read one block of frames
@@ -118,6 +145,11 @@ class WaveformFrameReader:
                 self.block_size, self.frame_bytes
             )
             timestamps = arr[:, :WAVEFORM_TIMESTAMP_BYTES].copy().view("<u4").reshape(-1)
+            deltas = (timestamps[1:].astype(np.uint64) - timestamps[:-1].astype(np.uint64)) & 0xffffffff
+            if (np.any(deltas != 1) or (self._last_timestamp is not None and
+                    int(timestamps[0]) != ((self._last_timestamp + 1) & 0xffffffff))):
+                raise WaveformStreamError("RHX waveform timestamp gap/reset; start a new acquisition")
+            self._last_timestamp = int(timestamps[-1])
             wave_u16 = (
                 arr[:, WAVEFORM_TIMESTAMP_BYTES:]
                 .copy()
@@ -153,6 +185,10 @@ class WaveformFrameReader:
             (timestamps, wave_uv) tuple. May return fewer than n_frames
             if not enough data has been received yet.
         """
+        self._raise_if_failed()
+        if n_frames is not None and (isinstance(n_frames, bool) or
+                not isinstance(n_frames, Integral) or n_frames < 1):
+            raise ValueError("n_frames must be a positive integer or None")
         if not self._parsed_ts:
             return (
                 np.array([], dtype=np.uint32),
@@ -217,6 +253,7 @@ class IntanTCPClient:
         self._command_lock = threading.RLock()
         self._command_buffer = bytearray()
         self._prepared_profiles = {}
+        self.prepared_session = None
         self._trigger_history = deque()
 
         self._command_socket: Optional[socket.socket] = None
@@ -233,15 +270,21 @@ class IntanTCPClient:
         self._command_socket = self._connect(self.command_port, timeout)
         self._command_buffer.clear()
         self._prepared_profiles.clear()
+        self.prepared_session = None
         return self
 
     def connect_waveform(self, timeout=5.0):
         """Establish waveform data TCP connection."""
+        if self._waveform_socket is not None:
+            raise RuntimeError("Waveform connection already has an owner")
         self._waveform_socket = self._connect(self.waveform_port, timeout)
+        self._waveform_reader = None
         return self
 
     def connect_spike(self, timeout=5.0):
         """Establish spike data TCP connection."""
+        if self._spike_socket is not None:
+            raise RuntimeError("Spike connection already has an owner")
         self._spike_socket = self._connect(self.spike_port, timeout)
         return self
 
@@ -265,8 +308,8 @@ class IntanTCPClient:
         self._spike_socket = None
         self._command_buffer.clear()
         self._prepared_profiles.clear()
-        if self._waveform_reader is not None:
-            self._waveform_reader.reset()
+        self.prepared_session = None
+        self._waveform_reader = None
 
     def _connect(self, port, timeout):
         """Create and connect a TCP socket."""
@@ -289,7 +332,7 @@ class IntanTCPClient:
     # an 80-cmd batch under ~5 s. Do NOT set below 20 ms.
     INTER_COMMAND_DELAY_S = 0.05
 
-    def send_command(self, command, expect_response=True, timeout=2.0):
+    def send_command(self, command, expect_response=True, timeout=2.0, *, _allow_warnings=False):
         """
         Send an ASCII command and optionally read the response.
 
@@ -322,12 +365,18 @@ class IntanTCPClient:
                 return receive_fenced_reply(
                     sock, self._command_buffer, timeout=timeout,
                     run_mode_query=command.lower() == "get runmode",
+                    allow_warnings=_allow_warnings,
                 )
+            except RHXCommandError:
+                self._prepared_profiles.clear()
+                self.prepared_session = None
+                raise
             except (OSError, TimeoutError, ConnectionError):
                 # A late reply must never satisfy a later request.
                 sock.close()
                 self._command_socket = None
                 self._prepared_profiles.clear()
+                self.prepared_session = None
                 self._command_buffer.clear()
                 raise
             finally:
@@ -340,11 +389,16 @@ class IntanTCPClient:
         stim_set = (words[0] == "set" and "." in action and
                     action.split(".")[-1] in self.STIM_PARAMETER_NAMES)
         stim_execute = words[0] == "execute" and action.startswith((
-            "manualstimtrigger", "uploadstim", "uploadampsettle", "uploadchargerecovery"))
-        if (stim_set or stim_execute) and self.execution_mode != "live":
+            "manualstimtrigger", "uploadstim", "uploadampsettle", "uploadchargerecovery",
+            "loadsettingsfile", "loadstimulationsettingsfile"))
+        global_stim_set = words[0] == "set" and action in self.GLOBAL_STIM_PARAMETERS
+        if (stim_set or stim_execute or global_stim_set) and self.execution_mode != "live":
             raise PermissionError(f"{self.execution_mode} does not send stimulation commands")
-        if stim_set or (words[0] == "execute" and action == "uploadstimparameters"):
+        if stim_set or global_stim_set or (words[0] == "execute" and action in {
+                "uploadstimparameters", "uploadampsettlesettings", "uploadchargerecoverysettings",
+                "loadsettingsfile", "loadstimulationsettingsfile", "rescanports"}):
             self._prepared_profiles.clear()
+            self.prepared_session = None
         if words[0] == "execute" and action == "manualstimtriggeron":
             raise RuntimeError("Latched stimulation is unsupported; use verified pulse scheduling")
         if words[0] == "execute" and action == "manualstimtriggerpulse":
@@ -377,7 +431,22 @@ class IntanTCPClient:
         "maintainampsettle", "enablechargerecovery", "prestimampsettlemicroseconds",
         "poststimampsettlemicroseconds", "poststimchargerecovonmicroseconds",
         "poststimchargerecovoffmicroseconds",
+        "firstphaseamplitudevolts", "secondphaseamplitudevolts", "baselinevoltagevolts",
     })
+
+    GLOBAL_STIM_PARAMETERS = frozenset({
+        "usefastsettle", "headstageglobalsettle", "desiredlowersettlebandwidthhertz",
+        "chargerecovery", "chargerecoverycurrentlimitmicroamps", "chargerecoverytargetvoltagevolts",
+    })
+
+    def _get_value(self, parameter):
+        # RHX returns a bare field name for channel/port StateItems, e.g.
+        # 'Return: StimEnabled True', not 'Return: A-000.StimEnabled True'.
+        response = self.get(parameter)
+        words = response.split(maxsplit=2)
+        if len(words) != 3 or words[0] != "Return:":
+            raise RHXCommandError(f"Malformed RHX response for {parameter}: {response}")
+        return words[2]
 
     def get(self, parameter, timeout=2.0):
         """
@@ -425,7 +494,7 @@ class IntanTCPClient:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             response = self.get("UploadInProgress", timeout=max(.01, deadline - time.monotonic()))
-            if response.split()[-1].lower() == "false":
+            if not rhx_bool(response.split()[-1], "UploadInProgress"):
                 return
             time.sleep(0.05)
         raise TimeoutError("RHX stimulation upload did not finish")
@@ -433,24 +502,28 @@ class IntanTCPClient:
     # ── Convenience Commands ───────────────────────────────────────
 
     def run(self, verify=False):
-        """
-        Start data acquisition.
-
-        Default `verify=False`: after the Set, we DO NOT immediately Get RunMode.
-        Reason: RHX serialises command processing — if any Set commands have
-        been sent recently, an immediate Get may time out while RHX catches up.
-        See MAINTENANCE.md §4. Pass `verify=True` only on a fresh socket with
-        no prior Sets in flight (and even then expect occasional timeouts).
-        """
-        return self.set("RunMode", "Run", verify=verify)
+        """Start Run from Stop after uploads; repeated Run is a no-op."""
+        return self._transition_run_mode("Run", verify)
 
     def stop(self, verify=False):
-        """Stop data acquisition. See `run()` docstring for verify default rationale."""
-        return self.set("RunMode", "Stop", verify=verify)
+        """Stop if running; RHX rejects a raw Stop when already stopped."""
+        return self._transition_run_mode("Stop", verify)
 
     def record(self, verify=False):
-        """Start recording to disk. See `run()` docstring for verify default rationale."""
-        return self.set("RunMode", "Record", verify=verify)
+        """Start Record from Stop after uploads; do not silently restart Run."""
+        return self._transition_run_mode("Record", verify)
+
+    def _transition_run_mode(self, mode, verify):
+        with self._command_lock:
+            current = self.get("RunMode")
+            if current == f"Return: RunMode {mode}":
+                return current if verify else None
+            if mode != "Stop":
+                if current != "Return: RunMode Stop":
+                    raise RuntimeError(f"Stop RHX before changing acquisition mode to {mode}")
+                self.wait_for_upload()
+            self.set("RunMode", mode)
+            return self.wait_for_run_mode(mode) if verify else None
 
     def get_sample_rate(self):
         """Query current sample rate in Hz."""
@@ -480,7 +553,7 @@ class IntanTCPClient:
                     "stimenabled": "true",
                     "source": "keypressf1",
                     "shape": "Biphasic",
-                    "polarity": "CathodicFirst",
+                    "polarity": "NegativeFirst",
                     "firstphasedurationmicroseconds": "500",
                     "secondphasedurationmicroseconds": "500",
                     "firstphaseamplitudemicroamps": "10",
@@ -542,7 +615,14 @@ class IntanTCPClient:
                 "pulseortrain": "SinglePulse", "numberofstimpulses": "1",
                 "triggeredgeorlevel": "Edge", "triggerhighorlow": "High",
                 "posttriggerdelaymicroseconds": "0",
+                "enableampsettle": "true", "maintainampsettle": "false",
+                "enablechargerecovery": "false",
+                "prestimampsettlemicroseconds": "0",
+                "poststimampsettlemicroseconds": "1000",
+                "poststimchargerecovonmicroseconds": "0",
+                "poststimchargerecovoffmicroseconds": "0",
                 "refractoryperiodmicroseconds": "1000",
+                "pulsetrainperiodmicroseconds": "1000000",
             }
             commands.extend((f"Set {name}.{k} {v}", k) for k, v in params.items())
         return commands
@@ -575,29 +655,47 @@ class IntanTCPClient:
                 raise RuntimeError("Stop RHX before configuring/uploading stimulation")
             self.wait_for_upload()
             self._prepared_profiles.clear()
-            # Disable all amplifier channels first: F1..F8 triggers are global,
-            # so a previous session's other headstage must not share a route.
-            disabled_channels = []
+            self.prepared_session = None
+            hardware = RHSProfile.read(self._get_value)
+            pulse_codes = {f"{channel_prefix}-{p.channel:03d}": hardware.validate_pulse(p)
+                           for p in protocol.pulses}
+            inventory = {}
             for port in "ABCD":
-                count = int(self.get(f"{port}.NumberAmplifierChannels").split()[-1])
+                count = int(self._get_value(f"{port}.NumberAmplifierChannels"))
                 if not 0 <= count <= 32:
                     raise RuntimeError("Expected an RHS controller with at most 32 channels per port")
+                inventory[port] = count
+            if protocol.n_channels > inventory[channel_prefix]:
+                raise RuntimeError("Requested stimulation channels are absent from the RHS inventory")
+            global_parameters = (
+                "UseFastSettle", "HeadstageGlobalSettle", "DesiredLowerSettleBandwidthHertz",
+                "ActualLowerSettleBandwidthHertz", "ChargeRecovery",
+                "ChargeRecoveryCurrentLimitMicroAmps", "ChargeRecoveryTargetVoltageVolts")
+            global_settings = {p: self._get_value(p) for p in global_parameters}
+            # Disable all amplifier channels first: F1..F8 triggers are global,
+            # and affect analog/digital outputs as well as other headstages.
+            disabled_channels = []
+            for port, count in inventory.items():
                 for ch in range(count):
-                    name = f"{port}-{ch:03d}"
-                    disabled_channels.append(name)
-                    self.set(f"{name}.stimenabled", "false")
-                    time.sleep(self.INTER_COMMAND_DELAY_S)
+                    disabled_channels.append(f"{port}-{ch:03d}")
+            for port, count in (("ANALOG-OUT", 8 if hardware.expander_connected else 2),
+                                ("DIGITAL-OUT", 16 if hardware.expander_connected else 2)):
+                disabled_channels.extend(f"{port}-{ch}" for ch in range(1, count + 1))
+            for name in disabled_channels:
+                self.set(f"{name}.stimenabled", "false")
+                time.sleep(self.INTER_COMMAND_DELAY_S)
             results = []
             for cmd, _ in commands:
                 self.send_command(cmd, expect_response=False)
                 results.append((cmd, None))
                 time.sleep(self.INTER_COMMAND_DELAY_S)
-            # A fenced Get surfaces asynchronous Set errors before uploading.
-            self.get("RunMode")
+            # RHX warns after EACH dependency-related Set, even while a stopped
+            # profile is still being assembled. Preserve these warnings; hard
+            # errors still abort. The final complete profile is read back below.
+            staged = self.send_command("Get RunMode", _allow_warnings=True)
+            warning_text = staged[:staged.rfind("Return:")].strip()
             if not upload_to_hardware:
                 return results
-            self.send_command("Execute UploadStimParameters", expect_response=False)
-            self.wait_for_upload()
             # Verify software profile, including mode/delay fields that used to
             # depend silently on whatever was last selected in the GUI.
             for cmd, _ in commands:
@@ -616,9 +714,25 @@ class IntanTCPClient:
                     raise RuntimeError(f"RHX profile mismatch: {name}.stimenabled")
             if active_names - set(disabled_channels):
                 raise RuntimeError("A requested stimulation channel is absent from the RHS inventory")
+            # Only a complete, verified software profile may be uploaded.
+            # Apply the selected GLOBAL settle mode too; channel StimParameters
+            # upload alone does not apply these chip-level settings (TCP p.60).
+            self.send_command("Execute UploadAmpSettleSettings", expect_response=False)
+            self.wait_for_upload()
+            global_settings = {p: self._get_value(p) for p in global_parameters}
+            self.send_command("Execute UploadStimParameters", expect_response=False)
+            self.wait_for_upload()
             for pulse in protocol.pulses:
                 self._prepared_profiles[f"f{pulse.channel + 1}"] = self._pulse_signature(pulse)
-            results.append(("Execute UploadStimParameters", None))
+            self.prepared_session = {
+                "hardware": hardware.as_dict(), "pulse_codes": pulse_codes,
+                "disabled_output_names": [n for n in disabled_channels if n not in active_names],
+                "global_stimulation_settings": global_settings,
+                "configuration_warnings": warning_text,
+                "physical_delivery_verified": False,
+            }
+            results.extend((("Execute UploadAmpSettleSettings", None),
+                            ("Execute UploadStimParameters", None)))
             return results
 
     def prepare_protocols(self, protocols, channel_prefix="A"):
@@ -711,9 +825,8 @@ class IntanTCPClient:
         """
         Read raw bytes from waveform output socket.
 
-        The data format depends on RHX configuration. Typically:
-        - 2 bytes (int16) per sample per channel
-        - Channels interleaved
+        Raw RHX block bytes, including magic and timestamps. Payload types and
+        scaling depend on enabled signal types; they are not signed int16 µV.
 
         Args:
             n_bytes: Number of bytes to read.
@@ -728,7 +841,7 @@ class IntanTCPClient:
         while len(data) < n_bytes:
             chunk = self._waveform_socket.recv(min(n_bytes - len(data), 65536))
             if not chunk:
-                break
+                raise ConnectionError("Waveform socket closed before requested bytes arrived")
             data += chunk
         return data
 
@@ -737,9 +850,13 @@ class IntanTCPClient:
         Initialize or reset the waveform frame reader.
 
         Call this once after connect_waveform() and before reading data.
-        Pass the EXACT number of channels you added to "Channels To Stream"
-        in the Intan RHX TCP Waveform Output panel.
+        This reader supports amplifier voltage words (WIDE/LOW/HIGH) only.
+        Pass the exact number of enabled voltage words in native stream order.
+        DC/STIM/TTL/auxiliary/board analog signals require a typed layout parser;
+        they cannot be converted using the amplifier's 0.195 µV/bit scale.
         """
+        if self._waveform_reader is not None:
+            raise RuntimeError("Reconnect before resetting an active waveform parser")
         self._waveform_reader = WaveformFrameReader(n_channels)
         return self._waveform_reader
 
@@ -767,7 +884,7 @@ class IntanTCPClient:
         Args:
             n_samples: Number of time samples (frames) to return.
             n_channels: Number of channels in the stream (must match Intan TCP config).
-            timeout: Per-recv timeout in seconds.
+            timeout: Total read deadline in seconds, including partial blocks.
 
         Returns:
             timestamps: (n_samples,) uint32 array.
@@ -780,28 +897,42 @@ class IntanTCPClient:
         if self._waveform_socket is None:
             raise ConnectionError("Waveform socket not connected.")
 
-        if self._waveform_reader is None or self._waveform_reader.n_channels != n_channels:
+        if (isinstance(n_samples, bool) or not isinstance(n_samples, Integral) or n_samples < 1):
+            raise ValueError("n_samples must be a positive integer")
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be finite and positive")
+        if self._waveform_reader is not None and self._waveform_reader.n_channels != n_channels:
+            raise ValueError("Do not change waveform layout on an active stream; reconnect first")
+        if self._waveform_reader is None:
             self._waveform_reader = WaveformFrameReader(n_channels)
-
-        self._waveform_socket.settimeout(timeout)
-        ts, wave = self._waveform_reader.read_frames(n_samples)
-        while ts.shape[0] < n_samples:
-            try:
-                chunk = self._waveform_socket.recv(65536)
-            except socket.timeout:
-                raise TimeoutError(
-                    f"Timed out waiting for waveform data "
-                    f"({ts.shape[0]}/{n_samples} samples received)"
-                )
-            if not chunk:
-                break
-            self._waveform_reader.add_data(chunk)
-            new_ts, new_wave = self._waveform_reader.read_frames(n_samples - ts.shape[0])
-            if new_ts.shape[0] > 0:
-                ts = np.concatenate([ts, new_ts])
-                wave = np.concatenate([wave, new_wave], axis=1)
-
-        return ts[:n_samples], wave[:, :n_samples]
+        sock = self._waveform_socket
+        previous_timeout = sock.gettimeout()
+        deadline = time.monotonic() + timeout
+        try:
+            ts, wave = self._waveform_reader.read_frames(n_samples)
+            while ts.shape[0] < n_samples:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Waveform read exceeded its total deadline")
+                sock.settimeout(remaining)
+                chunk = sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError("Waveform socket closed before a complete sample window")
+                self._waveform_reader.add_data(chunk)
+                new_ts, new_wave = self._waveform_reader.read_frames(n_samples - ts.shape[0])
+                if new_ts.shape[0] > 0:
+                    ts = np.concatenate([ts, new_ts])
+                    wave = np.concatenate([wave, new_wave], axis=1)
+            return ts, wave
+        except (OSError, TimeoutError, WaveformStreamError):
+            # Partial windows cannot be silently reused after a failed read.
+            sock.close()
+            self._waveform_socket = None
+            self._waveform_reader = None
+            raise
+        finally:
+            if self._waveform_socket is sock:
+                sock.settimeout(previous_timeout)
 
     def read_waveform_samples_uv_only(self, n_samples, n_channels, timeout=10.0):
         """Convenience: same as read_waveform_samples but returns only the µV array."""
@@ -829,7 +960,7 @@ class IntanTCPClient:
         while len(data) < n_bytes:
             chunk = self._spike_socket.recv(min(n_bytes - len(data), 65536))
             if not chunk:
-                break
+                raise ConnectionError("Spike socket closed before requested bytes arrived")
             data += chunk
         return data
 

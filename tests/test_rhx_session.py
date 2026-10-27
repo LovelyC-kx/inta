@@ -11,6 +11,14 @@ from intan_interface.tcp_client import IntanTCPClient
 class FakeRHXSocket:
     def __init__(self):
         self.values = {"runmode": "Stop", "uploadinprogress": "False",
+                       "type": "ControllerStimRecord", "version": "3.5.0",
+                       "synthetic": "True", "playback": "False",
+                       "sampleratehertz": "30000", "stimstepsizemicroamps": "0.5",
+                       "expanderconnected": "False", "usefastsettle": "False",
+                       "headstageglobalsettle": "False", "desiredlowersettlebandwidthhertz": "1000",
+                       "actuallowersettlebandwidthhertz": "1205.9", "chargerecovery": "CurrentLimited",
+                       "chargerecoverycurrentlimitmicroamps": "0.01",
+                       "chargerecoverytargetvoltagevolts": "0",
                        **{f"{p}.numberamplifierchannels": "8" if p == "a" else "0"
                           for p in "abcd"}}
         self.pending = bytearray()
@@ -31,14 +39,22 @@ class FakeRHXSocket:
                 continue
             words = cmd.split()
             if words[0].lower() == "set":
+                if words[1].lower() == "runmode":
+                    current = self.values["runmode"]
+                    if (words[2] == "Stop" and current == "Stop") or (
+                            words[2] != "Stop" and current != "Stop"):
+                        self.pending.extend(b"Error: Board is in the wrong run mode")
+                        continue
                 self.values[words[1].lower()] = words[2]
             elif words[0].lower() == "get":
                 key = words[1]
                 if key.lower() not in self.values:
                     self.pending.extend(b"Error: Unrecognized parameter")
                 else:
-                    key = "RunMode" if key.lower() == "runmode" else key
-                    self.pending.extend(f"Return: {key} {self.values[key.lower()]}".encode())
+                    value = self.values[key.lower()]
+                    # RHX StateItem replies omit channel/port prefixes.
+                    key = "RunMode" if key.lower() == "runmode" else key.split(".")[-1]
+                    self.pending.extend(f"Return: {key} {value}".encode())
 
     def recv(self, count):
         if not self.pending:

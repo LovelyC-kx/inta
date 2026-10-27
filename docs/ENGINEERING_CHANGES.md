@@ -93,3 +93,26 @@ from electrical delivery verification; old or ambiguous recording directories ar
 
 依据：官方 `Engine/Processing/DataFileReaders/filepersignaltypemanager.cpp` 的位域解码；
 随库RHX 3.5.0 TCP文档规定InterphaseDelayMicroseconds为0..5000µs。
+
+## 4. Review against the user-supplied RHX manuals
+
+详见 [手册逐项复审与剩余缺口](RHX_MANUAL_REVIEW_2026-10-26.md)。
+
+- 上传前查询 RHS 类型、版本、Demo/Playback、采样率、电流步长及扩展板状态。
+  幅度必须为 1..255 个电流步，相宽/间隔必须为整数采样步；拒绝静默量化。
+- Stop/Run/Record 按已确认状态转换；重复 Stop 不再向 RHX 发送会报错的命令。
+- 所有 amplifier、模拟/数字刺激路由禁用状态在上传前核实，防止旧 F-key 配置一起触发。
+- 通道 settle/recovery 字段明确设置，另上传全局 settle 配置并等待完成。
+- Stop 配置事务保存中间态 warning；最终完整字段回读与所有禁用状态通过后才上传。
+  Error 始终失败；加载配置、重扫、相关全局设置变更和 RHX 错误撤销触发缓存。
+- 5001 验证 magic、块内/块间连续时间，支持 uint32 回绕；EOF/总超时不再返回短窗口。
+  当前解析器仅适用于 amplifier voltage words，不能用于 STIM/TTL/DC 混合布局。
+- 前端保存 rhx_session.json 和 trial_log.json，用真实采样率/电流步长分析本次录音；
+  time.dat 跳变、参数冲突均失败。保存通道名映射仍待从 info.rhs 接入。
+
+English: manual review adds RHS representability checks, idempotent state transitions, complete
+output-route verification, explicit settle settings, validated configuration transactions, waveform
+integrity checks, and recording metadata binding. Typed STIM/TTL alignment and real task integration
+remain pending; see the linked review for source pages and acceptance requirements.
+
+验证 / Validation: **150 offline tests passed**, including 35 new regressions; no hardware test.

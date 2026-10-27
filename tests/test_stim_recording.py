@@ -25,6 +25,23 @@ def test_flags_are_not_stimulation_current(flag):
     assert find_pulse_onsets(np.array([0, flag, 0], dtype=np.uint16)).size == 0
 
 
+def test_recording_timestamp_gap_is_not_treated_as_contiguous(tmp_path):
+    data = bipolar()
+    write_recording(tmp_path, data)
+    times = np.arange(len(data), dtype="<u4")
+    times[10:] += 1
+    times.tofile(tmp_path / "time.dat")
+    with pytest.raises(ValueError, match="timestamp gap/reset"):
+        summarize(tmp_path, n_channels=1, plot=False)
+
+
+def test_conflicting_session_metadata_is_rejected(tmp_path):
+    write_recording(tmp_path, bipolar())
+    (tmp_path / "config.json").write_text(json.dumps({"sample_rate_hz": 30000}))
+    with pytest.raises(ValueError, match="disagree"):
+        summarize(tmp_path, n_channels=1, plot=False, sample_rate_hz=20000)
+
+
 def test_bit_layout_matches_official_rhs_reader():
     result = decode_stim_words(np.array([0xE114], dtype=np.uint16))
     assert result["magnitude"][0] == 20

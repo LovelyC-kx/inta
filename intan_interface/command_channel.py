@@ -27,7 +27,8 @@ def validate_command(command):
     return command.strip()
 
 
-def receive_fenced_reply(sock, buffer, *, timeout, run_mode_query=False):
+def receive_fenced_reply(sock, buffer, *, timeout, run_mode_query=False,
+                         allow_warnings=False):
     """Consume target reply plus an ordered `Get RunMode` barrier.
 
     send_command holds the connection lock from write through this read. For a
@@ -42,7 +43,8 @@ def receive_fenced_reply(sock, buffer, *, timeout, run_mode_query=False):
             fence = matches[required - 1]
             body = bytes(buffer[:fence.start()]).decode("ascii", errors="strict").strip()
             del buffer[:fence.end()]
-            if re.search(r"(?:Error|Warning)\s*[:-]", body, re.IGNORECASE):
+            if re.search(r"Error\s*[:-]", body, re.IGNORECASE) or (
+                    not allow_warnings and re.search(r"Warning\s*[:-]", body, re.IGNORECASE)):
                 raise RHXCommandError(body)
             if not body:
                 raise RHXCommandError("No response to the command before RHX barrier")

@@ -24,7 +24,7 @@ These are software defaults; electrode-specific electrical validation is require
 
 Safety constraints (defaults; can be made stricter via validate_safety):
     - Max amplitude per pulse: 50 µA
-    - Max charge per pulse: 25 nC (= 50 µA × 500 µs)
+    - Max charge per phase: 25 nC (= 50 µA × 500 µs)
     - Min inter-pulse interval per channel: 200 ms
     - Max pulses per second per channel: 5
     - Required charge balance (|charge_pos - charge_neg| < tol)
@@ -48,10 +48,8 @@ MIN_INTER_PULSE_MS = 200.0           # Minimum gap between pulses on same channe
 DEFAULT_AMPLITUDE_UA = 10.0          # Conservative default current
 DEFAULT_PHASE_DURATION_US = 500.0
 DEFAULT_INTERPHASE_DELAY_US = 0.0    # 0 for charge-balanced biphasic
-DEFAULT_POLARITY = "NegativeFirst"   # RHX accepts NegativeFirst/PositiveFirst only.
-                                     # CathodicFirst (the in-vitro literature term)
-                                     # is rejected — RHX command channel hangs.
-                                     # Cathodic == negative-current-first; same thing.
+DEFAULT_POLARITY = "NegativeFirst"   # RHX token for cathodic current first.
+                                    # CathodicFirst is not a valid RHX token.
 DEFAULT_WAVEFORM = "Biphasic"
 
 # Hard safety ceilings (raise consciously; never silently)

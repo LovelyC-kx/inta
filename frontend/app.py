@@ -366,6 +366,20 @@ def _wait_upload_done(client, timeout_s=10.0):
     raise TimeoutError(f"UploadInProgress did not become False: {last}")
 
 
+def _analyze_session_recording(recording, n_channels, session, protocol_summary, timing):
+    """Bind a unique new recording to its queried hardware, not a 30kHz guess."""
+    if not session or "hardware" not in session:
+        raise RuntimeError("Missing verified RHX session metadata")
+    (recording / "rhx_session.json").write_text(json.dumps(session, indent=2), encoding="utf-8")
+    (recording / "trial_log.json").write_text(json.dumps([{
+        "total_pulses": protocol_summary["total_pulses"],
+        "protocol": protocol_summary, "host_trigger_timing": timing,
+    }], indent=2), encoding="utf-8")
+    return summarize_stim_dat(recording, n_channels=n_channels, plot=False,
+                             sample_rate_hz=session["hardware"]["sample_rate_hz"],
+                             stim_step_ua=session["hardware"]["stim_step_ua"])
+
+
 def _set_rhx_run_mode(host, port, action):
     client = _connect_command(host, port, timeout=8.0)
     try:
@@ -446,6 +460,8 @@ def _run_single_stim_job(config):
 
         log_event("Uploading stimulation parameters while stopped.")
         client.send_protocol_config(proto, upload_to_hardware=True)
+        hardware_session = client.prepared_session
+        push_event("rhx_session", hardware_session)
         _wait_upload_done(client)
 
         if experiment_state.get("emergency_stop"):
@@ -492,7 +508,8 @@ def _run_single_stim_job(config):
             raise RuntimeError(f"stim.dat not found in {recording}")
 
         log_event("Analyzing stim.dat.")
-        stim_summary = summarize_stim_dat(recording, n_channels=n_channels, plot=False)
+        stim_summary = _analyze_session_recording(recording, n_channels, hardware_session,
+                                                 protocol_summary, timing)
         info = _file_info(recording)
         update_state(
             status="stopped",
@@ -577,6 +594,8 @@ def _run_manual_single_pulse_job(config):
 
         log_event("Uploading single-pulse parameters.")
         client.send_protocol_config(proto, upload_to_hardware=True)
+        hardware_session = client.prepared_session
+        push_event("rhx_session", hardware_session)
         _wait_upload_done(client)
 
         if experiment_state.get("emergency_stop"):
@@ -619,7 +638,8 @@ def _run_manual_single_pulse_job(config):
                 raise RuntimeError(f"stim.dat not found in {recording}")
 
             log_event("Analyzing stim.dat.")
-            stim_summary = summarize_stim_dat(recording, n_channels=n_channels, plot=False)
+            stim_summary = _analyze_session_recording(recording, n_channels, hardware_session,
+                                                     protocol_summary, timing)
             info = _file_info(recording)
             result_payload["recording"] = info
             result_payload["stim_summary"] = stim_summary
@@ -631,7 +651,7 @@ def _run_manual_single_pulse_job(config):
             status="stopped",
             operation=None,
             latest_recording=latest_recording,
-            total_stims_sent=experiment_state.get("total_stims_sent", 0) + 1,
+            total_stims_sent=experiment_state.get("total_stims_sent", 0) + len(timing),
             total_charge_nc=experiment_state.get("total_charge_nc", 0.0) + protocol_summary["total_charge_nc"],
             dry_run=True,
         )
