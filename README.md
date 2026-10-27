@@ -2,6 +2,7 @@
 
 类器官电生理工程组件：图像编码、Intan RHX 接口、事件解码与机械臂控制。
 当前修改与接口迁移见 [ENGINEERING_CHANGES.md](docs/ENGINEERING_CHANGES.md)。
+数字交互控制机械臂及刺激/读取专项测试见 [DEMO_BENCH.md](docs/DEMO_BENCH.md)。
 
 ## 连续开环入口
 
