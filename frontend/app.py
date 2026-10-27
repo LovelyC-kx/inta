@@ -13,6 +13,7 @@ import os
 import queue
 import threading
 import time
+from functools import wraps
 from datetime import datetime
 from pathlib import Path
 
@@ -50,6 +51,7 @@ app = Flask(__name__, template_folder="templates", static_folder="static")
 event_queue = queue.Queue(maxsize=2000)
 state_lock = threading.Lock()
 operation_lock = threading.Lock()
+stim_cancel_event = threading.Event()
 
 experiment_state = {
     "status": "idle",
@@ -110,8 +112,8 @@ def _parse_return_value(response):
     return parts[-1] if parts else response
 
 
-def _connect_command(host="127.0.0.1", port=5000, timeout=8.0):
-    client = IntanTCPClient(host=host, command_port=port)
+def _connect_command(host="127.0.0.1", port=5000, timeout=8.0, execution_mode="acquire_only"):
+    client = IntanTCPClient(host=host, command_port=port, execution_mode=execution_mode)
     client.connect_command(timeout=timeout)
     return client
 
@@ -149,6 +151,18 @@ def _query_rhx_status(host="127.0.0.1", port=5000):
         return fields
     finally:
         client.disconnect()
+
+
+def _exclusive_hardware_route(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not operation_lock.acquire(blocking=False):
+            return jsonify({"ok": False, "error": "Hardware session is busy."}), 409
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            operation_lock.release()
+    return wrapped
 
 
 def _load_mnist_image(digit, root):
@@ -357,10 +371,7 @@ def _set_rhx_run_mode(host, port, action):
         log_event(message)
         command_fn()
         time.sleep(1.0 if action != "stop" else 2.0)
-        try:
-            run_mode = _parse_return_value(client.get("RunMode")) or mode
-        except Exception:
-            run_mode = mode
+        run_mode = _parse_return_value(client.wait_for_run_mode(mode))
         update_state(tcp_command_connected=True, run_mode=run_mode)
         return {"action": action, "run_mode": run_mode}
     finally:
@@ -374,6 +385,7 @@ def _run_single_stim_job(config):
         return
 
     client = None
+    stim_cancel_event.clear()
     try:
         update_state(
             status="running",
@@ -401,7 +413,7 @@ def _run_single_stim_job(config):
         before = _recording_snapshot(DATA_ROOT)
 
         log_event(f"Connecting command TCP {host}:{port}.")
-        client = _connect_command(host, port, timeout=8.0)
+        client = _connect_command(host, port, timeout=8.0, execution_mode="live")
         update_state(tcp_command_connected=True)
 
         try:
@@ -413,7 +425,7 @@ def _run_single_stim_job(config):
 
         log_event("Stopping RHX before changing upload/file settings.")
         client.stop()
-        time.sleep(2.0)
+        client.wait_for_run_mode("Stop")
 
         log_event("Ensuring OneFilePerSignalType and timestamp directories.")
         _set_file_settings(client)
@@ -443,35 +455,9 @@ def _run_single_stim_job(config):
         log_event("Triggering timed pulses.")
         t0 = time.perf_counter()
         timing = []
-        for pulse in sorted(proto.pulses, key=lambda p: (p.time_ms, p.channel)):
-            if experiment_state.get("emergency_stop"):
-                raise RuntimeError("Emergency stop requested during trigger sequence.")
-            target = t0 + pulse.time_ms / 1000.0
-            while True:
-                remaining = target - time.perf_counter()
-                if remaining <= 0:
-                    break
-                if remaining > 0.002:
-                    time.sleep(remaining - 0.002)
-            actual_ms = (time.perf_counter() - t0) * 1000.0
-            client.send_command(
-                f"Execute ManualStimTriggerPulse F{pulse.channel + 1}",
-                expect_response=False,
-            )
-            entry = {
-                "channel": int(pulse.channel),
-                "target_ms": round(float(pulse.time_ms), 3),
-                "actual_ms": round(float(actual_ms), 3),
-                "drift_ms": round(float(actual_ms - pulse.time_ms), 3),
-            }
-            timing.append(entry)
+        timing = client.play_prepared_protocol(proto, cancel_event=stim_cancel_event)
+        for entry in timing:
             push_event("timing", entry)
-            log_event(
-                "Triggered A-{channel:03d}: target {target_ms:.1f} ms, drift {drift_ms:+.3f} ms.".format(
-                    **entry
-                )
-            )
-
         time.sleep(float(config.get("post_trigger_s", 2.0)))
         log_event("Stopping Record.")
         client.stop()
@@ -529,9 +515,13 @@ def _run_single_stim_job(config):
     finally:
         if client is not None:
             try:
+                client.stop()
+                client.wait_for_run_mode("Stop")
+            except Exception as stop_error:
+                log_event(f"Stop could not be confirmed: {stop_error}", "error")
+                update_state(run_mode="Unknown")
+            finally:
                 client.disconnect()
-            except Exception:
-                pass
         update_state(tcp_command_connected=False)
         operation_lock.release()
 
@@ -542,6 +532,7 @@ def _run_manual_single_pulse_job(config):
         return
 
     client = None
+    stim_cancel_event.clear()
     try:
         update_state(
             status="running",
@@ -572,12 +563,12 @@ def _run_manual_single_pulse_job(config):
         before = _recording_snapshot(DATA_ROOT) if record_to_disk else None
 
         log_event(f"Connecting command TCP {host}:{port}.")
-        client = _connect_command(host, port, timeout=8.0)
+        client = _connect_command(host, port, timeout=8.0, execution_mode="live")
         update_state(tcp_command_connected=True)
 
         log_event("Stopping RHX before upload.")
         client.stop()
-        time.sleep(2.0)
+        client.wait_for_run_mode("Stop")
 
         if record_to_disk:
             log_event("Ensuring OneFilePerSignalType and timestamp directories.")
@@ -601,29 +592,9 @@ def _run_manual_single_pulse_job(config):
         log_event("Triggering manual pulse sequence.")
         t0 = time.perf_counter()
         timing = []
-        for pulse in sorted(proto.pulses, key=lambda p: (p.time_ms, p.channel)):
-            target = t0 + pulse.time_ms / 1000.0
-            while True:
-                remaining = target - time.perf_counter()
-                if remaining <= 0:
-                    break
-                if remaining > 0.002:
-                    time.sleep(remaining - 0.002)
-            actual_ms = (time.perf_counter() - t0) * 1000.0
-            client.send_command(
-                f"Execute ManualStimTriggerPulse F{pulse.channel + 1}",
-                expect_response=False,
-            )
-            entry = {
-                "channel": int(pulse.channel),
-                "target_ms": round(float(pulse.time_ms), 3),
-                "actual_ms": round(float(actual_ms), 3),
-                "drift_ms": round(float(actual_ms - pulse.time_ms), 3),
-            }
-            timing.append(entry)
+        timing = client.play_prepared_protocol(proto, cancel_event=stim_cancel_event)
+        for entry in timing:
             push_event("timing", entry)
-        log_event("Manual trigger sequence complete.")
-
         time.sleep(float(config.get("post_trigger_s", 1.0)))
 
         log_event("Stopping RHX.")
@@ -680,9 +651,13 @@ def _run_manual_single_pulse_job(config):
     finally:
         if client is not None:
             try:
+                client.stop()
+                client.wait_for_run_mode("Stop")
+            except Exception as stop_error:
+                log_event(f"Stop could not be confirmed: {stop_error}", "error")
+                update_state(run_mode="Unknown")
+            finally:
                 client.disconnect()
-            except Exception:
-                pass
         update_state(tcp_command_connected=False)
         operation_lock.release()
 
@@ -735,6 +710,7 @@ def get_system_status():
 
 
 @app.route("/api/rhx/status", methods=["POST"])
+@_exclusive_hardware_route
 def rhx_status():
     payload = request.json or {}
     try:
@@ -749,6 +725,7 @@ def rhx_status():
 
 
 @app.route("/api/rhx/control", methods=["POST"])
+@_exclusive_hardware_route
 def rhx_control():
     payload = request.json or {}
     try:
@@ -841,6 +818,7 @@ def stop_experiment():
 
 @app.route("/api/emergency_stop", methods=["POST"])
 def emergency_stop():
+    stim_cancel_event.set()
     update_state(emergency_stop=True, status="emergency_stopped")
     push_event("control", {"action": "emergency_stop"})
     log_event("Emergency stop requested.", "error")

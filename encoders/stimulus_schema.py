@@ -32,6 +32,9 @@ Safety constraints (defaults; can be made stricter via validate_safety):
 ============================================================================
 """
 
+import math
+from numbers import Integral, Real
+
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -109,21 +112,27 @@ class StimulusProtocol:
         Check structural invariants. Raises ValueError on violation.
         Call this after construction. Returns self for chaining.
         """
-        if self.n_channels > MAX_STIM_CHANNELS:
+        if (isinstance(self.n_channels, bool) or not isinstance(self.n_channels, Integral)
+                or not 1 <= self.n_channels <= MAX_STIM_CHANNELS):
             raise ValueError(
                 f"n_channels={self.n_channels} exceeds MAX_STIM_CHANNELS={MAX_STIM_CHANNELS}"
             )
-        if self.duration_ms > MAX_DURATION_MS:
+        if (not _finite_number(self.duration_ms) or
+                not 0 < self.duration_ms <= MAX_DURATION_MS):
             raise ValueError(
                 f"duration_ms={self.duration_ms} exceeds MAX_DURATION_MS={MAX_DURATION_MS}"
             )
 
         for p in self.pulses:
-            if p.channel < 0 or p.channel >= self.n_channels:
+            if not isinstance(p, Pulse):
+                raise ValueError("Every protocol event must be a Pulse")
+            if (isinstance(p.channel, bool) or not isinstance(p.channel, Integral)
+                    or p.channel < 0 or p.channel >= self.n_channels):
                 raise ValueError(
                     f"Pulse channel={p.channel} out of range [0, {self.n_channels})"
                 )
-            if p.time_ms < 0 or p.time_ms > self.duration_ms:
+            if (not _finite_number(p.time_ms) or
+                    p.time_ms < 0 or p.time_ms > self.duration_ms):
                 raise ValueError(
                     f"Pulse time_ms={p.time_ms} out of range [0, {self.duration_ms}]"
                 )
@@ -162,9 +171,40 @@ class StimulusProtocol:
         This MUST pass before sending the protocol to real hardware.
         Returns self for chaining.
         """
+        self.validate()
+        limits = {
+            "max_amplitude_ua": max_amplitude_ua,
+            "max_phase_duration_us": max_phase_duration_us,
+            "max_charge_per_pulse_nc": max_charge_per_pulse_nc,
+            "max_total_charge_per_trial_nc": max_total_charge_per_trial_nc,
+            "max_pulses_per_sec": max_pulses_per_sec,
+            "max_pulses_per_trial": max_pulses_per_trial,
+            "charge_balance_tol_nc": charge_balance_tol_nc,
+        }
+        if any(not _finite_number(v) or v < 0 for v in limits.values()):
+            raise ValueError("Safety limits must be finite, nonnegative numbers")
         violations = []
 
         for p in self.pulses:
+            invalid_fields = [name for name in ("amplitude_ua", "phase_duration_us",
+                              "interphase_delay_us")
+                              if not _finite_number(getattr(p, name))]
+            if invalid_fields:
+                violations.append(f"Pulse ch={p.channel}: non-finite/invalid {invalid_fields}")
+                continue
+            if p.amplitude_ua <= 0 or p.phase_duration_us <= 0 or p.interphase_delay_us < 0:
+                violations.append(f"Pulse ch={p.channel}: amplitude and phase duration must be "
+                                  "positive; interphase delay must be nonnegative")
+            if p.polarity not in ("NegativeFirst", "PositiveFirst"):
+                violations.append(f"Pulse ch={p.channel}: unsupported polarity {p.polarity!r}")
+            supported = ("Biphasic", "BiphasicWithInterphaseDelay")
+            if p.waveform not in supported:
+                # Pulse represents symmetric two-phase current only. Allowing a
+                # different shape requires a schema with explicit phase charges.
+                violations.append(f"Pulse ch={p.channel}: unsupported waveform {p.waveform!r}; "
+                                  "only charge-balanced biphasic waveforms are represented")
+            if p.waveform == "Biphasic" and p.interphase_delay_us != 0:
+                violations.append("Use BiphasicWithInterphaseDelay for a nonzero interphase delay")
             if p.amplitude_ua > max_amplitude_ua:
                 violations.append(
                     f"Pulse ch={p.channel} t={p.time_ms}ms: "
@@ -182,14 +222,16 @@ class StimulusProtocol:
                     f"charge {p.charge_per_phase_nc:.2f} nC > limit "
                     f"{max_charge_per_pulse_nc} nC"
                 )
-            if not allow_monophasic and p.waveform.lower() == "monophasic":
+            if not allow_monophasic and str(p.waveform).lower() == "monophasic":
                 violations.append(
                     f"Pulse ch={p.channel} t={p.time_ms}ms: "
                     f"monophasic not allowed (no charge recovery)"
                 )
 
         # Total charge per trial (sum of both phases for biphasic)
-        total_charge_nc = sum(p.charge_per_phase_nc for p in self.pulses) * 2
+        total_charge_nc = sum(p.charge_per_phase_nc for p in self.pulses
+                             if _finite_number(p.amplitude_ua) and
+                             _finite_number(p.phase_duration_us)) * 2
         if total_charge_nc > max_total_charge_per_trial_nc:
             violations.append(
                 f"Total trial charge {total_charge_nc:.1f} nC > limit "
@@ -280,6 +322,10 @@ class StimulusProtocol:
 
 class SafetyViolation(Exception):
     """Raised when a StimulusProtocol fails safety validation."""
+
+
+def _finite_number(value):
+    return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def euclidean_distance(proto_a, proto_b, n_time_bins=10):

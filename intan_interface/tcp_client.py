@@ -15,7 +15,7 @@ Usage:
 Reference: Intan RHX TCP Guide (available on Intan website)
 
 VERIFIED waveform stream format (RHS Demo, 8ch WIDE, 30 kS/s):
-    Stream starts with 4-byte header/magic (one-time, post-connect).
+    Each block starts with a 4-byte magic followed by 128 frames.
     Each subsequent frame:
         [4 bytes: timestamp, little-endian uint32]
         [n_channels * 2 bytes: samples, little-endian uint16, offset-binary]
@@ -26,9 +26,13 @@ VERIFIED waveform stream format (RHS Demo, 8ch WIDE, 30 kS/s):
 
 import socket
 import struct
+import threading
 import time
+from collections import deque
 import numpy as np
 from typing import Optional
+
+from .command_channel import receive_fenced_reply, validate_command
 
 
 # ── Verified Intan waveform stream format constants ────────────
@@ -194,6 +198,7 @@ class IntanTCPClient:
         command_port=5000,
         waveform_port=5001,
         spike_port=5002,
+        execution_mode="acquire_only",
     ):
         """
         Args:
@@ -206,6 +211,13 @@ class IntanTCPClient:
         self.command_port = command_port
         self.waveform_port = waveform_port
         self.spike_port = spike_port
+        if execution_mode not in ("simulate", "acquire_only", "live"):
+            raise ValueError("execution_mode must be simulate, acquire_only, or live")
+        self.execution_mode = execution_mode
+        self._command_lock = threading.RLock()
+        self._command_buffer = bytearray()
+        self._prepared_profiles = {}
+        self._trigger_history = deque()
 
         self._command_socket: Optional[socket.socket] = None
         self._waveform_socket: Optional[socket.socket] = None
@@ -216,7 +228,11 @@ class IntanTCPClient:
 
     def connect_command(self, timeout=5.0):
         """Establish command TCP connection."""
+        if self._command_socket is not None:
+            raise RuntimeError("Command connection already has an owner")
         self._command_socket = self._connect(self.command_port, timeout)
+        self._command_buffer.clear()
+        self._prepared_profiles.clear()
         return self
 
     def connect_waveform(self, timeout=5.0):
@@ -247,14 +263,22 @@ class IntanTCPClient:
         self._command_socket = None
         self._waveform_socket = None
         self._spike_socket = None
+        self._command_buffer.clear()
+        self._prepared_profiles.clear()
         if self._waveform_reader is not None:
             self._waveform_reader.reset()
 
     def _connect(self, port, timeout):
         """Create and connect a TCP socket."""
+        if self.execution_mode == "simulate":
+            raise RuntimeError("simulate never opens hardware sockets; use an offline/replay backend")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
-        sock.connect((self.host, port))
+        try:
+            sock.connect((self.host, port))
+        except Exception:
+            sock.close()
+            raise
         return sock
 
     # ── Command Interface ──────────────────────────────────────────
@@ -281,22 +305,79 @@ class IntanTCPClient:
             ConnectionError: If command socket is not connected.
             TimeoutError: If no response received within timeout.
         """
-        if self._command_socket is None:
-            raise ConnectionError("Command socket not connected. Call connect_command() first.")
+        command = validate_command(command)
+        with self._command_lock:
+            self._guard_stimulation_command(command)
+            if self._command_socket is None:
+                raise ConnectionError("Command socket not connected. Call connect_command() first.")
+            # RHX splits on semicolons. An ordered Get fences replies even
+            # on versions which do not terminate responses with a newline.
+            msg = command + (";Get RunMode;" if expect_response else ";")
+            sock = self._command_socket
+            previous_timeout = sock.gettimeout()
+            try:
+                sock.sendall(msg.encode("ascii"))
+                if not expect_response:
+                    return None
+                return receive_fenced_reply(
+                    sock, self._command_buffer, timeout=timeout,
+                    run_mode_query=command.lower() == "get runmode",
+                )
+            except (OSError, TimeoutError, ConnectionError):
+                # A late reply must never satisfy a later request.
+                sock.close()
+                self._command_socket = None
+                self._prepared_profiles.clear()
+                self._command_buffer.clear()
+                raise
+            finally:
+                if self._command_socket is sock:
+                    sock.settimeout(previous_timeout)
 
-        # Intan RHX expects commands terminated with newline
-        msg = command.strip() + "\n"
-        self._command_socket.sendall(msg.encode("ascii"))
+    def _guard_stimulation_command(self, command):
+        words = command.lower().split()
+        action = words[1] if len(words) > 1 else ""
+        stim_set = (words[0] == "set" and "." in action and
+                    action.split(".")[-1] in self.STIM_PARAMETER_NAMES)
+        stim_execute = words[0] == "execute" and action.startswith((
+            "manualstimtrigger", "uploadstim", "uploadampsettle", "uploadchargerecovery"))
+        if (stim_set or stim_execute) and self.execution_mode != "live":
+            raise PermissionError(f"{self.execution_mode} does not send stimulation commands")
+        if stim_set:
+            self._prepared_profiles.clear()
+        if words[0] == "execute" and action == "manualstimtriggeron":
+            raise RuntimeError("Latched stimulation is unsupported; use verified pulse scheduling")
+        if words[0] == "execute" and action == "manualstimtriggerpulse":
+            if len(words) != 3 or words[2] not in self._prepared_profiles:
+                raise RuntimeError("Trigger has no verified uploaded profile; prepare it while stopped")
+            # One budget covers sensory, feedback and direct manual pulses.
+            from encoders.stimulus_schema import (MIN_INTER_PULSE_MS,
+                                                 SAFETY_MAX_TOTAL_CHARGE_PER_TRIAL_NC)
+            now = time.monotonic()
+            while self._trigger_history and self._trigger_history[0][0] <= now - 2.0:
+                self._trigger_history.popleft()
+            key = words[2]
+            if any(k == key and now - t < MIN_INTER_PULSE_MS / 1000.0
+                   for t, k, _ in self._trigger_history):
+                raise RuntimeError("Trigger would violate the session inter-pulse interval")
+            amp, phase, *_ = self._prepared_profiles[key]
+            charge = 2.0 * amp * phase / 1000.0
+            if sum(q for _, _, q in self._trigger_history) + charge > SAFETY_MAX_TOTAL_CHARGE_PER_TRIAL_NC:
+                raise RuntimeError("Trigger would exceed the rolling 2-second charge budget")
+            # Reserve on attempt; failed writes are not automatically retried.
+            self._trigger_history.append((now, key, charge))
 
-        if not expect_response:
-            return None
-
-        self._command_socket.settimeout(timeout)
-        try:
-            response = self._recv_until_newline(self._command_socket)
-            return response.strip()
-        except socket.timeout:
-            raise TimeoutError(f"No response for command: {command}")
+    STIM_PARAMETER_NAMES = frozenset({
+        "stimenabled", "source", "shape", "polarity", "pulseortrain",
+        "triggeredgeorlevel", "triggerhighorlow", "posttriggerdelaymicroseconds",
+        "refractoryperiodmicroseconds", "firstphasedurationmicroseconds",
+        "secondphasedurationmicroseconds", "interphasedelaymicroseconds",
+        "firstphaseamplitudemicroamps", "secondphaseamplitudemicroamps",
+        "numberofstimpulses", "pulsetrainperiodmicroseconds", "enableampsettle",
+        "maintainampsettle", "enablechargerecovery", "prestimampsettlemicroseconds",
+        "poststimampsettlemicroseconds", "poststimchargerecovonmicroseconds",
+        "poststimchargerecovoffmicroseconds",
+    })
 
     def get(self, parameter):
         """
@@ -330,40 +411,24 @@ class IntanTCPClient:
             return self.get(parameter)
         return None
 
-    def _recv_until_newline(self, sock, bufsize=4096):
-        """
-        Receive one Intan RHX command response.
+    def wait_for_run_mode(self, mode, timeout=10.0):
+        """Poll confirmed state; never substitute the requested state on error."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            response = self.get("RunMode")
+            if response == f"Return: RunMode {mode}":
+                return response
+            time.sleep(0.05)
+        raise TimeoutError(f"RHX did not enter {mode}")
 
-        Important RHX behavior verified during local testing:
-            Raw socket command:
-                send: b"Get RunMode\\n"
-                recv: b"Return: RunMode Run"
-
-        Some RHX versions return a complete ASCII response without a trailing
-        newline. Therefore this function must NOT wait strictly for "\\n".
-        It returns as soon as the buffer looks like a complete RHX response
-        ("Return:" or "Error:"), while still supporting newline-terminated
-        responses.
-        """
-        data = b""
-
-        while True:
-            chunk = sock.recv(bufsize)
-            if not chunk:
-                break
-
-            data += chunk
-
-            # Standard newline-terminated response.
-            if b"\n" in data:
-                break
-
-            # RHX may return a complete response without a newline.
-            text = data.decode("ascii", errors="ignore").strip()
-            if text.startswith("Return:") or text.startswith("Error:"):
-                break
-
-        return data.decode("ascii", errors="ignore")
+    def wait_for_upload(self, timeout=30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            response = self.get("UploadInProgress")
+            if response.split()[-1].lower() == "false":
+                return
+            time.sleep(0.05)
+        raise TimeoutError("RHX stimulation upload did not finish")
 
     # ── Convenience Commands ───────────────────────────────────────
 
@@ -450,237 +515,179 @@ class IntanTCPClient:
         Returns:
             List of (command_string, description) tuples.
         """
+        protocol.validate()
+        if channel_prefix not in ("A", "B", "C", "D"):
+            raise ValueError("RHS channel prefix must be A, B, C, or D")
         commands = []
-
-        pulses_by_ch = {}
-        for p in protocol.pulses:
-            pulses_by_ch.setdefault(p.channel, []).append(p)
-
-        for ch_idx in range(protocol.n_channels):
-            ch_name = f"{channel_prefix}-{ch_idx:03d}"
-            ch_pulses = pulses_by_ch.get(ch_idx, [])
-
-            if not ch_pulses:
-                commands.append((
-                    f"Set {ch_name}.stimenabled false",
-                    f"Disable stim on {ch_name} (no pulses)",
-                ))
+        by_channel = {}
+        for pulse in protocol.pulses:
+            signature = self._pulse_signature(pulse)
+            if pulse.channel in by_channel and by_channel[pulse.channel] != signature:
+                raise ValueError("A channel cannot change pulse parameters inside a prepared session")
+            by_channel[pulse.channel] = signature
+        for ch in range(protocol.n_channels):
+            name = f"{channel_prefix}-{ch:03d}"
+            if ch not in by_channel:
+                commands.append((f"Set {name}.stimenabled false", "Disable unused channel"))
                 continue
-
-            pulse = ch_pulses[0]
-
-            commands.append((
-                f"Set {ch_name}.stimenabled true",
-                f"Enable stim on {ch_name}",
-            ))
-            commands.append((
-                f"Set {ch_name}.source KeyPressF{ch_idx + 1}",
-                f"Trigger source: F{ch_idx + 1} key",
-            ))
-            commands.append((
-                f"Set {ch_name}.shape {pulse.waveform}",
-                f"Waveform shape",
-            ))
-            commands.append((
-                f"Set {ch_name}.polarity {pulse.polarity}",
-                f"Polarity",
-            ))
-            commands.append((
-                f"Set {ch_name}.firstphasedurationmicroseconds "
-                f"{int(pulse.phase_duration_us)}",
-                f"Phase 1 duration",
-            ))
-            commands.append((
-                f"Set {ch_name}.secondphasedurationmicroseconds "
-                f"{int(pulse.phase_duration_us)}",
-                f"Phase 2 duration",
-            ))
-            commands.append((
-                f"Set {ch_name}.interphasedelaymicroseconds "
-                f"{int(pulse.interphase_delay_us)}",
-                f"Interphase delay",
-            ))
-            commands.append((
-                f"Set {ch_name}.firstphaseamplitudemicroamps "
-                f"{pulse.amplitude_ua:.1f}",
-                f"Phase 1 amplitude (µA)",
-            ))
-            commands.append((
-                f"Set {ch_name}.secondphaseamplitudemicroamps "
-                f"{pulse.amplitude_ua:.1f}",
-                f"Phase 2 amplitude (µA)",
-            ))
-            commands.append((
-                f"Set {ch_name}.numberofstimpulses 1",
-                f"Single pulse per trigger",
-            ))
-
-        # NOTE: `Execute UploadStimParameters` was tried here but RHX rejects
-        # it with "Set commands require a parameter and a value" — wrong
-        # syntax. The actual command name / required args are TBD. For now
-        # we rely on RHX auto-uploading Set changes (which it appears to do
-        # in newer versions). If stim.dat stays empty, revisit and find the
-        # correct Upload command.
-
+            amp, phase, delay, polarity, waveform = by_channel[ch]
+            params = {
+                "stimenabled": "true", "source": f"KeyPressF{ch + 1}",
+                "shape": waveform, "polarity": polarity,
+                "firstphasedurationmicroseconds": f"{phase:g}",
+                "secondphasedurationmicroseconds": f"{phase:g}",
+                "interphasedelaymicroseconds": f"{delay:g}",
+                "firstphaseamplitudemicroamps": f"{amp:g}",
+                "secondphaseamplitudemicroamps": f"{amp:g}",
+                "pulseortrain": "SinglePulse", "numberofstimpulses": "1",
+                "triggeredgeorlevel": "Edge", "triggerhighorlow": "High",
+                "posttriggerdelaymicroseconds": "0",
+                "refractoryperiodmicroseconds": "1000",
+            }
+            commands.extend((f"Set {name}.{k} {v}", k) for k, v in params.items())
         return commands
 
+    @staticmethod
+    def _pulse_signature(pulse):
+        return (pulse.amplitude_ua, pulse.phase_duration_us, pulse.interphase_delay_us,
+                pulse.polarity, pulse.waveform)
+
     def send_protocol_config(self, protocol, channel_prefix="A",
-                             skip_safety_check=False,
-                             upload_to_hardware=False):
+                             skip_safety_check=False, upload_to_hardware=False):
+        """Stage parameters while stopped; optionally upload and verify them.
+
+        No upload is not a dry-run: old parameters remain in the controller.
+        Non-live clients validate the protocol but send no stimulation commands.
+        Use prepare_protocols() once before continuous acquisition.
         """
-        Send all configuration commands for a StimulusProtocol.
-
-        SAFETY MODEL — this method is dry-run BY DEFAULT:
-            By default `upload_to_hardware=False`, so Set commands land in
-            RHX's software state but the final `Execute UploadStimParameters`
-            is SKIPPED. RHX accepts subsequent `Execute ManualStimTriggerPulse`
-            but fires whatever was last uploaded (initial state = 0 µA), so
-            stim.dat stays empty / silent. This is the intended dry-run
-            mode for organoid-pre-Gate-A safety: stimulus plumbing exercised,
-            but no current leaves the headstage.
-
-            Only pass `upload_to_hardware=True` AFTER:
-              1. CHECKLIST_REAL_ORGANOID.md Gate A is passed
-                 (oscilloscope + dummy load shows correct biphasic current)
-              2. The caller explicitly opted in (e.g. run_with_dashboard
-                 --live-stim with ENABLE_STIM phrase typed).
-
-        SAFETY: This method always calls protocol.validate_safety() before
-        sending, even if skip_safety_check=True (which only suppresses raises).
-
-        Args:
-            protocol: A validated StimulusProtocol.
-            channel_prefix: Port prefix.
-            skip_safety_check: ONLY for unit tests with synthetic protocols.
-                               Real-hardware callers must leave this False.
-            upload_to_hardware: If True, emit `Execute UploadStimParameters`
-                                after the Set burst, committing parameters
-                                so subsequent triggers fire real current.
-                                Default False = dry-run.
-
-        Returns:
-            List of (command, response) tuples.
-
-        Raises:
-            SafetyViolation: If protocol.validate_safety() fails.
-            ValueError: If protocol.validate() fails.
-        """
-        # Structural validation (always)
-        protocol.validate()
-
-        # Safety validation — refused before any TCP send
-        if not skip_safety_check:
-            from encoders.stimulus_schema import SafetyViolation
-            try:
-                protocol.validate_safety()
-            except SafetyViolation:
-                raise
-        else:
-            # Even when skipped (tests only), log a warning
-            try:
-                protocol.validate_safety()
-            except Exception as e:
-                print(f"[TCP-WARN] safety check skipped, would have raised: {e}")
-
+        protocol.validate_safety()
+        if skip_safety_check:
+            raise ValueError("Skipping stimulation validation is no longer supported")
         commands = self.protocol_to_commands(protocol, channel_prefix)
-        results = []
-        for cmd, desc in commands:
-            resp = self.send_command(cmd, expect_response=False)
-            results.append((cmd, resp))
-            # Throttle: without this gap, RHX silently drops half the Sets
-            # AND backlogs the next Get. See INTER_COMMAND_DELAY_S note.
-            time.sleep(self.INTER_COMMAND_DELAY_S)
-
-        # Hardware commit gate — see method docstring SAFETY MODEL.
-        # Skipping Upload is what makes dry-run safe: RHX accepts triggers
-        # but stim.dat stays empty because the new params never reached HW.
-        if upload_to_hardware:
+        if self.execution_mode != "live":
+            return []
+        with self._command_lock:
+            if self.get("RunMode") != "Return: RunMode Stop":
+                raise RuntimeError("Stop RHX before configuring/uploading stimulation")
+            self.wait_for_upload()
+            self._prepared_profiles.clear()
+            # Disable all amplifier channels first: F1..F8 triggers are global,
+            # so a previous session's other headstage must not share a route.
+            for port in "ABCD":
+                count = int(self.get(f"{port}.NumberAmplifierChannels").split()[-1])
+                if not 0 <= count <= 32:
+                    raise RuntimeError("Expected an RHS controller with at most 32 channels per port")
+                for ch in range(count):
+                    self.set(f"{port}-{ch:03d}.stimenabled", "false")
+                    time.sleep(self.INTER_COMMAND_DELAY_S)
+            results = []
+            for cmd, _ in commands:
+                self.send_command(cmd, expect_response=False)
+                results.append((cmd, None))
+                time.sleep(self.INTER_COMMAND_DELAY_S)
+            # A fenced Get surfaces asynchronous Set errors before uploading.
+            self.get("RunMode")
+            if not upload_to_hardware:
+                return results
             self.send_command("Execute UploadStimParameters", expect_response=False)
+            self.wait_for_upload()
+            # Verify software profile, including mode/delay fields that used to
+            # depend silently on whatever was last selected in the GUI.
+            for cmd, _ in commands:
+                _, param, expected = cmd.split()
+                actual = self.get(param).split()[-1]
+                try:
+                    matches = float(actual) == float(expected)
+                except ValueError:
+                    matches = actual.casefold() == expected.casefold()
+                if not matches:
+                    raise RuntimeError(f"RHX profile mismatch: {param}={actual}, expected {expected}")
+            for pulse in protocol.pulses:
+                self._prepared_profiles[f"f{pulse.channel + 1}"] = self._pulse_signature(pulse)
             results.append(("Execute UploadStimParameters", None))
-            time.sleep(self.INTER_COMMAND_DELAY_S)
-        return results
+            return results
 
-    def play_protocol_in_time(self, protocol, channel_prefix="A",
-                              skip_safety_check=False,
-                              upload_to_hardware=False):
+    def prepare_protocols(self, protocols, channel_prefix="A"):
+        """Upload the union of fixed channel profiles once, before Run/Record.
+
+        Trial timing can vary freely. Per-channel current/shape must be constant
+        across all sensory and feedback protocols within this session.
         """
-        Configure stim params + play the time-encoded pulse sequence as-is.
-
-        Unlike send_protocol_config (which only configures), this method
-        ALSO triggers each pulse at its `time_ms` relative to call start.
-        Use this when you want the encoder's temporal pattern to actually
-        reach the hardware.
-
-        Internal model:
-          - Each channel is configured once with first-pulse parameters
-            (RHX TCP API supports only one set of params per channel).
-          - All pulses (potentially multiple on same channel at different
-            times) are sorted by time_ms and triggered via
-            `Execute ManualStimTriggerPulse F<ch+1>` at the right moment.
-
-        Timing precision: ~1 ms on Windows (busy-wait for last ms after
-        a coarse sleep). Use shorter pulse trains to avoid drift.
-
-        This method BLOCKS for `protocol.duration_ms` (plus config overhead).
-        Don't call from a tight real-time loop unless you account for that.
-
-        Returns:
-            timing_log: list of dicts {target_ms, actual_ms, channel, drift_ms}
-        """
-        import time
-
-        protocol.validate()
-        if not skip_safety_check:
-            from encoders.stimulus_schema import SafetyViolation
+        from encoders.stimulus_schema import Pulse, StimulusProtocol
+        protocols = list(protocols)
+        if not protocols:
+            raise ValueError("At least one protocol is required")
+        profiles = {}
+        n_channels = max(p.n_channels for p in protocols)
+        for protocol in protocols:
             protocol.validate_safety()
+            for pulse in protocol.pulses:
+                signature = self._pulse_signature(pulse)
+                if pulse.channel in profiles and profiles[pulse.channel] != signature:
+                    raise ValueError("All protocols must use the same pulse profile per channel")
+                profiles[pulse.channel] = signature
+        pulses = [Pulse(ch, 0.0, *sig) for ch, sig in sorted(profiles.items())]
+        union = StimulusProtocol(pulses, n_channels, 2000.0)
+        return self.send_protocol_config(union, channel_prefix, upload_to_hardware=True)
 
-        # Step 1: configure each channel. Each Set must be throttled to avoid
-        # RHX backlog drops. With 50 ms gap an 8-channel/80-cmd protocol takes
-        # ~4 s — that's the cost of reliable configuration.
-        config_cmds = self.protocol_to_commands(protocol, channel_prefix)
-        for cmd, _ in config_cmds:
-            self.send_command(cmd, expect_response=False)
-            time.sleep(self.INTER_COMMAND_DELAY_S)
+    def play_prepared_protocol(self, protocol, cancel_event=None):
+        """Trigger every event using an already uploaded profile.
 
-        # Step 1b: optionally commit parameters to hardware.
-        # Default False = dry-run (RHX accepts triggers in Step 3 but fires
-        # whatever stim is currently uploaded — initial state = silent).
-        # See send_protocol_config docstring SAFETY MODEL for when to enable.
-        if upload_to_hardware:
-            self.send_command("Execute UploadStimParameters", expect_response=False)
-            time.sleep(self.INTER_COMMAND_DELAY_S)
-
-        # Step 2: sort pulses by time_ms
-        pulses_sorted = sorted(protocol.pulses, key=lambda p: (p.time_ms, p.channel))
-
-        # Step 3: play them out at their scheduled times
-        timing_log = []
-        t0 = time.perf_counter()
-        for pulse in pulses_sorted:
+        Times below measure host send scheduling, NOT electrode current onset.
+        Hardware marker measurements are required for electrical timing claims.
+        """
+        protocol.validate_safety()
+        for pulse in protocol.pulses:
+            if self._prepared_profiles.get(f"f{pulse.channel + 1}") != self._pulse_signature(pulse):
+                raise RuntimeError("Protocol does not match the verified uploaded profile")
+        if self.execution_mode != "live":
+            raise PermissionError("Only live mode can execute prepared stimulation")
+        if self.get("RunMode") not in ("Return: RunMode Run", "Return: RunMode Record"):
+            raise RuntimeError("RHX must be running before triggering a prepared protocol")
+        cancel_event = cancel_event or threading.Event()
+        t0 = time.monotonic()
+        timing = []
+        for pulse in protocol.pulses:
+            from encoders.stimulus_schema import MIN_INTER_PULSE_MS
             target = t0 + pulse.time_ms / 1000.0
-            # Coarse sleep until close, then busy-wait final 2 ms
+            key = f"f{pulse.channel + 1}"
+            target = max([target] + [t + MIN_INTER_PULSE_MS / 1000.0
+                                    for t, k, _ in self._trigger_history if k == key])
             while True:
-                remaining = target - time.perf_counter()
+                if cancel_event.is_set():
+                    raise InterruptedError("Stimulation cancelled before next trigger")
+                remaining = target - time.monotonic()
                 if remaining <= 0:
                     break
-                if remaining > 0.002:
-                    time.sleep(remaining - 0.002)
-                else:
-                    pass  # busy-spin
-            actual_ms = (time.perf_counter() - t0) * 1000.0
-            f_key = pulse.channel + 1
-            self.send_command(
-                f"Execute ManualStimTriggerPulse F{f_key}",
-                expect_response=False,
-            )
-            timing_log.append({
-                "target_ms": float(pulse.time_ms),
-                "actual_ms": round(actual_ms, 3),
-                "drift_ms": round(actual_ms - pulse.time_ms, 3),
-                "channel": int(pulse.channel),
-            })
+                cancel_event.wait(min(remaining, 0.01))
+            sent_ms = (time.monotonic() - t0) * 1000.0
+            self.send_command(f"Execute ManualStimTriggerPulse F{pulse.channel + 1}",
+                              expect_response=False)
+            timing.append({"target_ms": float(pulse.time_ms), "actual_ms": sent_ms,
+                           "drift_ms": sent_ms - pulse.time_ms, "channel": int(pulse.channel),
+                           "host_send_only": True, "hardware_sample": None})
+        return timing
 
-        return timing_log
+    def play_protocol_in_time(self, protocol, channel_prefix="A",
+                              skip_safety_check=False, upload_to_hardware=False):
+        """Compatibility entry point; default is strictly no-output.
+
+        For continuous acquisition use prepare_protocols(), start Run/Record,
+        then play_prepared_protocol(). This one-shot live path starts Run after
+        preparing while stopped. No electrical timing precision is guaranteed.
+        """
+        protocol.validate_safety()
+        if skip_safety_check:
+            raise ValueError("Skipping stimulation validation is no longer supported")
+        if not upload_to_hardware:
+            return [{"target_ms": float(p.time_ms), "actual_ms": None, "drift_ms": None,
+                     "channel": int(p.channel), "sent": False} for p in protocol.pulses]
+        if self.execution_mode != "live":
+            raise PermissionError("Set execution_mode='live' to upload and trigger")
+        self.send_protocol_config(protocol, channel_prefix, upload_to_hardware=True)
+        self.run()
+        self.wait_for_run_mode("Run")
+        return self.play_prepared_protocol(protocol)
 
     # ── Waveform Data Reception ────────────────────────────────────
 
@@ -734,7 +741,7 @@ class IntanTCPClient:
             extraction, decoder input) assumes this layout.
 
         Implements the verified Intan RHX waveform stream format:
-            stream header (4B, once) + frames of [timestamp(4B) + samples(2B*n_ch)]
+            repeated blocks: 4B magic + 128 frames of [timestamp(4B) + samples(2B*n_ch)]
             Samples are uint16 offset-binary, converted to microvolts.
 
         Across multiple calls, timestamps stay continuous: the last
