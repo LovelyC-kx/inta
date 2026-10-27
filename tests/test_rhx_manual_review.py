@@ -119,7 +119,7 @@ def test_stop_and_repeated_run_are_idempotent_and_record_requires_stop():
     assert b"Set RunMode Stop;" not in c._command_socket.sent
     c.run(verify=True)
     c.run(verify=True)
-    assert c._command_socket.sent.count(b"Set RunMode Run;") == 1
+    assert c._command_socket.sent.count(b"Get RunMode;Get RunMode;Set RunMode Run;") == 1
     with pytest.raises(RuntimeError, match="Stop RHX"):
         c.record()
     c.stop(verify=True)

@@ -50,6 +50,12 @@ class SocketPairRHX(IntanTCPClient):
 
         def send(data):
             original(data)
+            if (b"Set RunMode Record;" in data or b"Set RunMode Run;" in data) and self.thread is None:
+                # Hardware starts producing inside the Set handler, before
+                # the client can query confirmation of the new state.
+                self.clock_origin = time.monotonic()
+                self.thread = threading.Thread(target=self._produce, daemon=True)
+                self.thread.start()
             if data.startswith(b"Execute ManualStimTriggerPulse") and not self.drop_trigger:
                 key = data.decode().split()[-1].rstrip(";").lower()
                 # A hardware trigger is dated by the acquisition clock, even
@@ -69,13 +75,6 @@ class SocketPairRHX(IntanTCPClient):
     def connect_spike(self, *args, **kwargs):
         self._spike_socket, self.spike_tx = socket.socketpair()
         return self
-
-    def record(self, verify=False):
-        result = super().record(verify=verify)
-        self.clock_origin = time.monotonic()
-        self.thread = threading.Thread(target=self._produce, daemon=True)
-        self.thread.start()
-        return result
 
     def _produce(self):
         active = []

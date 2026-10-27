@@ -299,7 +299,7 @@ class RHXBackend:
         self._record_host_ns = time.monotonic_ns()
         self.started = True
         self.metadata["rhx_stop_confirmed"] = False
-        self.client.record(verify=True)
+        self.client.record(verify=True, startup_barrier=lambda: self._until(lambda: self.progress is not None))
         self._watchdog = threading.Thread(target=self._watch, name="RHX-fault-watchdog", daemon=True)
         self._watchdog.start()
         self._until(lambda: self.progress is not None)

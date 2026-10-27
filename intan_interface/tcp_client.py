@@ -332,7 +332,8 @@ class IntanTCPClient:
     # an 80-cmd batch under ~5 s. Do NOT set below 20 ms.
     INTER_COMMAND_DELAY_S = 0.05
 
-    def send_command(self, command, expect_response=True, timeout=2.0, *, _allow_warnings=False):
+    def send_command(self, command, expect_response=True, timeout=2.0, *, _allow_warnings=False,
+                     _prefence=False):
         """
         Send an ASCII command and optionally read the response.
 
@@ -349,13 +350,23 @@ class IntanTCPClient:
             TimeoutError: If no response received within timeout.
         """
         command = validate_command(command)
+        if _prefence and (not expect_response or command.lower() not in (
+                "set runmode run", "set runmode record", "set runmode trigger")):
+            raise ValueError("A pre-fence is only valid for a blocking acquisition start")
         with self._command_lock:
             self._guard_stimulation_command(command)
             if self._command_socket is None:
                 raise ConnectionError("Command socket not connected. Call connect_command() first.")
             # RHX splits on semicolons. An ordered Get fences replies even
             # on versions which do not terminate responses with a newline.
-            msg = command + (";Get RunMode;" if expect_response else ";")
+            # RHX enters a nested acquisition loop inside Set Run/Record.
+            # Queries after that Set in the SAME readClientCommand batch are
+            # stranded until Stop. Obtain replies BEFORE the Set instead:
+            # then confirm the new state in a separate request. Streaming
+            # owners also supply a startup_barrier below so no post-start
+            # query is sent until acquisition data proves Run was entered.
+            msg = ("Get RunMode;Get RunMode;" + command + ";") if _prefence else (
+                command + (";Get RunMode;" if expect_response else ";"))
             sock = self._command_socket
             previous_timeout = sock.gettimeout()
             try:
@@ -364,20 +375,22 @@ class IntanTCPClient:
                     return None
                 return receive_fenced_reply(
                     sock, self._command_buffer, timeout=timeout,
-                    run_mode_query=command.lower() == "get runmode",
+                    run_mode_query=_prefence or command.lower() == "get runmode",
                     allow_warnings=_allow_warnings,
                 )
             except RHXCommandError:
                 self._prepared_profiles.clear()
                 self.prepared_session = None
                 raise
-            except (OSError, TimeoutError, ConnectionError):
+            except (OSError, TimeoutError, ConnectionError) as exc:
                 # A late reply must never satisfy a later request.
                 sock.close()
                 self._command_socket = None
                 self._prepared_profiles.clear()
                 self.prepared_session = None
                 self._command_buffer.clear()
+                if isinstance(exc, TimeoutError):
+                    raise TimeoutError(f"{command}: {exc}") from exc
                 raise
             finally:
                 if self._command_socket is sock:
@@ -475,7 +488,9 @@ class IntanTCPClient:
         Returns:
             None (default), Set response, or Get response (if verify=True).
         """
-        self.send_command(f"Set {parameter} {value}", expect_response=expect_response)
+        startup = parameter.casefold() == "runmode" and str(value).casefold() in ("run", "record", "trigger")
+        self.send_command(f"Set {parameter} {value}", expect_response=True if startup else expect_response,
+                          timeout=10.0 if startup else 2.0, _prefence=startup)
         if verify:
             return self.get(parameter)
         return None
@@ -484,7 +499,7 @@ class IntanTCPClient:
         """Poll confirmed state; never substitute the requested state on error."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            response = self.get("RunMode", timeout=max(.01, min(2.0, deadline - time.monotonic())))
+            response = self.get("RunMode", timeout=max(.01, deadline - time.monotonic()))
             if response == f"Return: RunMode {mode}":
                 return response
             time.sleep(0.05)
@@ -501,19 +516,19 @@ class IntanTCPClient:
 
     # ── Convenience Commands ───────────────────────────────────────
 
-    def run(self, verify=False):
+    def run(self, verify=False, *, startup_barrier=None):
         """Start Run from Stop after uploads; repeated Run is a no-op."""
-        return self._transition_run_mode("Run", verify)
+        return self._transition_run_mode("Run", verify, startup_barrier)
 
     def stop(self, verify=False):
         """Stop if running; RHX rejects a raw Stop when already stopped."""
         return self._transition_run_mode("Stop", verify)
 
-    def record(self, verify=False):
+    def record(self, verify=False, *, startup_barrier=None):
         """Start Record from Stop after uploads; do not silently restart Run."""
-        return self._transition_run_mode("Record", verify)
+        return self._transition_run_mode("Record", verify, startup_barrier)
 
-    def _transition_run_mode(self, mode, verify):
+    def _transition_run_mode(self, mode, verify, startup_barrier=None):
         with self._command_lock:
             current = self.get("RunMode")
             if current == f"Return: RunMode {mode}":
@@ -523,6 +538,8 @@ class IntanTCPClient:
                     raise RuntimeError(f"Stop RHX before changing acquisition mode to {mode}")
                 self.wait_for_upload()
             self.set("RunMode", mode)
+            if startup_barrier is not None:
+                startup_barrier()
             return self.wait_for_run_mode(mode) if verify else None
 
     def get_sample_rate(self):

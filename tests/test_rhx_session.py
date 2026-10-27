@@ -85,6 +85,62 @@ def protocol(times=(0, 250, 500)):
     return StimulusProtocol([Pulse(0, t) for t in times], 8, 2000)
 
 
+class CoalescedStartSocket(FakeRHXSocket):
+    """Model Qt receiving a bare start and the next query in one read batch.
+
+    Set Run enters runController synchronously; later commands in that batch
+    cannot execute until Stop. A preceding reply proves the batch was read.
+    """
+    def __init__(self):
+        super().__init__()
+        self.unparsed_start = None
+
+    def sendall(self, data):
+        if data.startswith((b"Set RunMode Run;", b"Set RunMode Record;")):
+            self.unparsed_start = data
+            return
+        if self.unparsed_start is not None:
+            super().sendall(self.unparsed_start)
+            self.unparsed_start = None
+            # The new query was coalesced behind the blocking startup Set.
+            return
+        super().sendall(data)
+
+
+def test_legacy_start_then_query_can_be_stranded_in_same_rhx_batch():
+    c = client()
+    c._command_socket = CoalescedStartSocket()
+    c.send_command("Set RunMode Run", expect_response=False)
+    with pytest.raises(TimeoutError, match="Get RunMode"):
+        c.get("RunMode", timeout=.02)
+    assert not c.is_command_connected
+
+
+@pytest.mark.parametrize("mode", ["Run", "Record"])
+def test_start_prefence_keeps_confirmation_out_of_blocking_start_batch(mode):
+    c = client()
+    sock = CoalescedStartSocket()
+    c._command_socket = sock
+    method = c.run if mode == "Run" else c.record
+    assert method(verify=True) == f"Return: RunMode {mode}"
+    assert c.is_command_connected
+    packet = f"Get RunMode;Get RunMode;Set RunMode {mode};".encode()
+    assert packet in sock.sent
+    # No query follows the blocking Set inside its already-received batch.
+    assert packet.endswith(f"Set RunMode {mode};".encode())
+
+
+def test_mode_confirmation_uses_remaining_total_budget_not_two_second_cap():
+    c = client()
+    observed = []
+    def get(parameter, timeout):
+        observed.append(timeout)
+        return "Return: RunMode Run"
+    c.get = get
+    assert c.wait_for_run_mode("Run", timeout=10) == "Return: RunMode Run"
+    assert 9 < observed[0] <= 10
+
+
 def test_fragmented_delimiter_free_response_and_state_fence():
     c = client()
     assert c.get("RunMode") == "Return: RunMode Stop"

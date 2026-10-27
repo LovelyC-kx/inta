@@ -45,11 +45,8 @@ class DemoFixture(SocketPairRHX):
         self._command_socket.values["synthetic"] = "True"
         return self
 
-    def run(self, verify=False):
-        result = super().run(verify=verify)
-        self.clock_origin = time.monotonic()
-        self.thread = threading.Thread(target=self._produce, daemon=True)
-        self.thread.start()
+    def run(self, verify=False, *, startup_barrier=None):
+        result = super().run(verify=verify, startup_barrier=startup_barrier)
         # A spontaneous Demo spike is independent of any manual trigger.
         self.spike_tx.sendall(SPIKE_MAGIC + b"A-000" + struct.pack("<I", 0) + b"\x40")
         return result

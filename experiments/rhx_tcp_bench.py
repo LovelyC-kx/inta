@@ -63,6 +63,7 @@ def bench(args):
             emit("spike", asdict(event))
 
     try:
+        report["phase"] = "CONNECT_COMMAND"
         print(f"CONNECTING to actual RHX {args.host}:{args.cmd_port}", flush=True)
         c.connect_command(timeout=3)
         report["connected"] = True
@@ -79,6 +80,7 @@ def bench(args):
             raise ValueError("For this explicit 500us bench profile select 30 kS/s in RHX")
         report["hardware"] = hardware.as_dict()
         print("PREPARING: configure and read back three A-000 pulse commands (may take several seconds)", flush=True)
+        report["phase"] = "PREPARE_STIMULATION"
         c.prepare_protocols([protocol])
         report["prepared_session"] = c.prepared_session
         c.send_command("Execute ClearAllDataOutputs", expect_response=False)
@@ -110,7 +112,17 @@ def bench(args):
         for reader in readers:
             reader.start()
         started = True
-        c.run(verify=True)
+        report["phase"] = "ENTER_RUN"
+        def wait_for_stream():
+            until = time.monotonic() + 10
+            while not report["waveform_blocks"]:
+                drain()
+                if time.monotonic() >= until:
+                    raise TimeoutError("No 5001 acquisition data after Run request")
+                time.sleep(.01)
+        c.run(verify=True, startup_barrier=wait_for_stream)
+        report["phase"] = "TRIGGER_AND_RECEIVE"
+        print("RUN CONFIRMED: sending three trigger commands and receiving data", flush=True)
 
         def trigger():
             try:
@@ -189,7 +201,7 @@ def bench(args):
         emit("summary", report)
         log.close()
         (output / "session.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    keys = ("status", "connected", "triggers_sent", "waveform_blocks", "spike_events",
+    keys = ("status", "phase", "connected", "triggers_sent", "waveform_blocks", "spike_events",
             "stim_markers", "stim_record", "stop_confirmed", "raw_bytes",
             "physical_delivery_verified", "evoked_response_verified", "classification_tested",
             "error", "cleanup_error", "reader_error", "integrity_error")

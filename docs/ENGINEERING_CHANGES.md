@@ -171,3 +171,26 @@ It does not establish physical RHX delivery, transport bounds or biological deco
 失败输出目录保留诊断记录，下一次必须使用新目录（如 data/rhx_tcp02），不会覆盖旧实验。
 
 修正后全套离线回归：**213 passed**（95.89 s）。实际 RHX 修正后的联调结果待用户复验。
+
+## 8. Blocking Run/Record command batches
+
+用户再次实际联调：已配置并连接三个 TCP 服务，读到 479 个 5001 块和 9 个 spike，
+但在触发循环开始前命令回复超时，连接失效后无法确认 Stop。日志与调用位置指向启动状态确认。
+
+官方 `TCPDisplay::readClientCommand/parseCommands` 按每次 read() 拆分并同步逐条执行；
+`CommandParser::setRunModeCommand` 在 Run/Record 分支内同步调用 `runController()`，
+直到停止才返回。因此，紧接启动 Set 的 Get 若被 TCP 合并为同一批，查询可能滞留在
+阻塞调用之后。之前仅在后续查询中增加回复屏障不能解决这个启动特例。
+
+- Run/Record/Trigger 的 Set 使用前置回复屏障，同一批不再放置启动后的查询。
+- 新的实际 TCP bench 和统一 Record 后端，在发出启动请求后先等待实际 5001 数据，
+  再发送状态确认查询，避免该查询进入仍未处理的启动命令批。
+- 状态确认查询使用剩余总等待预算，而非被内部 2 秒单次上限提前截断。
+- 超时仍关闭连接并撤销已验证配置，禁止以旧回复继续；异常现在标明超时命令。
+- bench 显示失败 phase 与 RUN CONFIRMED，保留 Stop 确认失败；需要操作者现场停止。
+- 增加同批查询滞留与 Run/Record 前置屏障回归，模拟源在收到 Set 时即开始供数，
+  不再等客户端已经完成状态确认后才产生数据。
+
+修正后的真实 RHX 行为仍需用户复验，不能以模拟器测试代替。
+
+修正后全套离线回归：**217 passed**（87.38 s）。

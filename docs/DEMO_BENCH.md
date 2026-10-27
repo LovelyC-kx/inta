@@ -21,6 +21,11 @@ ANALOG-OUT-1。若旧版报 DIGITAL-OUT-1 的回读错误，请更新 intan_inte
 可选 TTL 修正位于 experiments/openloop_backend.py。失败目录保留原始诊断记录，重跑使用
 新的 --out（如 data/rhx_tcp02），不要覆盖此前的输出。
 
+如果已收到块和 spike，却在 CONNECTED 之后、RUN CONFIRMED 之前出现命令确认超时：
+先手动 Stop RHX，更新 intan_interface/tcp_client.py 和 experiments/rhx_tcp_bench.py。
+新版本先等待实际 5001 采集数据，再查询启动状态，并在报告中显示 phase。
+不要把尚未确认 Run 的计数当成触发成功；triggers_sent 仍必须完成后才计数。
+
 这是通过 TCP 连接用户实际运行的 RHX 软件；没有模拟服务器和失败后的替代数据。
 关闭 RHX 后，用新输出目录再次执行，必须报告 FAILED / connected=false 并返回非零退出码。
 该入口仅允许 Synthetic=True 的 RHS Demo，在任何配置写入前拒绝真实硬件及其他 controller。
