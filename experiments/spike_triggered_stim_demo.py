@@ -119,6 +119,7 @@ def run_demo(host, cmd_port, spike_port, n_channels, threshold, window_s,
                 if time.monotonic_ns() - event.host_rx_ns > 500_000_000:
                     raise SpikeStreamError("Neural events spent more than 500ms in the processing queue")
                 if policy.observe(event):
+                    reader.raise_if_failed()
                     summary["candidates"] += 1
                     timing = []
                     if not dry_run and event.native_channel in protocols:

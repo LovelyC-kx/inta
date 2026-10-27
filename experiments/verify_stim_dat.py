@@ -35,43 +35,95 @@ from utils.experiment_log import log_experiment
 
 
 def load_stim_dat(data_dir, n_channels):
-    """Read stim.dat → (n_channels, n_samples) int16 array."""
-    p = data_dir / "stim.dat"
-    if not p.exists():
-        raise FileNotFoundError(f"{p} not found")
-    raw = np.fromfile(str(p), dtype=np.int16)
-    n_samples = len(raw) // n_channels
-    return raw[:n_samples * n_channels].reshape(n_samples, n_channels).T
+    """Read little-endian uint16 bitfields without copying the entire file."""
+    if isinstance(n_channels, bool) or not isinstance(n_channels, int) or n_channels <= 0:
+        raise ValueError("n_channels must be a positive integer")
+    path = Path(data_dir) / "stim.dat"
+    size = path.stat().st_size
+    if size % (2 * n_channels):
+        raise ValueError("stim.dat is truncated or its saved channel count is incorrect")
+    if size == 0:
+        return np.zeros((n_channels, 0), dtype=np.uint16)
+    return np.memmap(path, mode="r", dtype="<u2").reshape(-1, n_channels).T
 
 
-def find_pulse_onsets(stim_ch):
+def decode_stim_words(stim):
+    """RHS bit layout from official filepersignaltypemanager.cpp.
+
+    Bits 0..7 magnitude; bit8 negative polarity; bit13 amp settle;
+    bit14 charge recovery; bit15 compliance limit. Flags are not current.
     """
-    Given a 1-D int16 stim signal for one channel, find sample indices of
-    pulse onsets (transitions from zero to non-zero).
+    words = np.asarray(stim).astype(np.uint16, copy=False)
+    magnitude = words & 0xFF
+    return {"magnitude": magnitude, "negative": (words & 0x100) != 0,
+            "amp_settle": (words & 0x2000) != 0,
+            "charge_recovery": (words & 0x4000) != 0,
+            "compliance_limit": (words & 0x8000) != 0,
+            "unknown_flags": (words & 0x1E00) != 0}
+
+
+def extract_biphasic_pulses(stim_ch, sample_rate=30000):
+    """Pair opposite-polarity phases, allowing RHS's <=5ms interphase gap.
+
+    Return complete symmetric-representation pulses plus unpaired phase count.
+    Pulse counts refer to two-phase events, not every nonzero run.
     """
-    nonzero = (stim_ch != 0).astype(np.int8)
-    # Rising edges: 0 → 1 transitions
-    onsets = np.where(np.diff(nonzero) == 1)[0] + 1
-    return onsets
+    if not np.isfinite(sample_rate) or sample_rate <= 0:
+        raise ValueError("sample_rate must be finite and positive")
+    decoded = decode_stim_words(stim_ch)
+    magnitude, negative = decoded["magnitude"], decoded["negative"]
+    active = magnitude != 0
+    prior_active = np.r_[False, active[:-1]]
+    next_active = np.r_[active[1:], False]
+    prior_negative = np.r_[False, negative[:-1]]
+    next_negative = np.r_[negative[1:], False]
+    starts = np.flatnonzero(active & (~prior_active | (negative != prior_negative)))
+    ends = np.flatnonzero(active & (~next_active | (negative != next_negative))) + 1
+    phases = []
+    for a, b in zip(starts, ends):
+        values = magnitude[a:b]
+        phases.append({"start": int(a), "end": int(b), "negative": bool(negative[a]),
+                       "amplitude_code": int(values[0]),
+                       "constant_amplitude": bool(np.all(values == values[0])),
+                       "charge_code_samples": int(values.sum(dtype=np.uint64))})
+    pulses = []
+    unpaired = 0
+    i = 0
+    while i < len(phases):
+        first = phases[i]
+        if i + 1 < len(phases):
+            second = phases[i + 1]
+            gap = second["start"] - first["end"]
+            if first["negative"] != second["negative"] and gap <= int(np.ceil(.005 * sample_rate)):
+                pulses.append({"onset_sample": first["start"], "end_sample": second["end"],
+                               "interphase_samples": gap, "phase1": first, "phase2": second,
+                               "charge_balanced_codes": first["charge_code_samples"] == second["charge_code_samples"]})
+                i += 2
+                continue
+        unpaired += 1
+        i += 1
+    return pulses, unpaired
 
 
-def estimate_charge_per_pulse(stim_ch, onset_idx, sample_rate=30000):
-    """
-    Approximate charge of one pulse by integrating |stim_ch| over the
-    pulse's nonzero span. Returns charge in nC (assuming 1 step = 0.01 µA;
-    not sure of exact RHS scaling, but the relative comparison is valid).
-    """
-    if onset_idx >= len(stim_ch):
-        return 0.0
-    end = onset_idx
-    while end < len(stim_ch) and stim_ch[end] != 0:
-        end += 1
-    span = stim_ch[onset_idx:end]
-    # crude approximation
-    return float(np.sum(np.abs(span)))
+def find_pulse_onsets(stim_ch, sample_rate=30000):
+    pulses, _ = extract_biphasic_pulses(stim_ch, sample_rate)
+    return np.array([p["onset_sample"] for p in pulses], dtype=np.int64)
 
 
-def summarize(data_dir, n_channels=64, n_stim_channels=8, plot=True):
+def estimate_charge_per_pulse(stim_ch, onset_idx, sample_rate=30000, stim_step_ua=None):
+    """Absolute two-phase charge in nC; never guess RHS current step size."""
+    if stim_step_ua is None or not np.isfinite(stim_step_ua) or stim_step_ua <= 0:
+        raise ValueError("An explicit positive stim_step_ua is required for charge in nC")
+    pulses, _ = extract_biphasic_pulses(stim_ch, sample_rate)
+    for pulse in pulses:
+        if pulse["onset_sample"] == onset_idx:
+            codes = pulse["phase1"]["charge_code_samples"] + pulse["phase2"]["charge_code_samples"]
+            return codes * stim_step_ua * 1000.0 / sample_rate
+    raise ValueError("onset_idx is not a complete biphasic pulse")
+
+
+def summarize(data_dir, n_channels=64, n_stim_channels=8, plot=True, stim_step_ua=None):
+    data_dir = Path(data_dir)
     config = {}
     cfg_path = data_dir / "config.json"
     if cfg_path.exists():
@@ -83,59 +135,68 @@ def summarize(data_dir, n_channels=64, n_stim_channels=8, plot=True):
     stim = load_stim_dat(data_dir, n_channels)
     n_samples = stim.shape[1]
     sample_rate = config.get("sample_rate_hz", 30000)
+    if not np.isfinite(sample_rate) or sample_rate <= 0:
+        raise ValueError("Invalid sample rate")
+    stim_step_ua = stim_step_ua if stim_step_ua is not None else config.get("stim_step_ua")
+    if stim_step_ua is not None and (not np.isfinite(stim_step_ua) or stim_step_ua <= 0):
+        raise ValueError("Invalid stim_step_ua")
     duration_s = n_samples / sample_rate
-
-    print(f"  shape: {stim.shape}  duration: {duration_s:.1f}s")
-
-    # ── Per-channel analysis ─────────────────────────────────
-    print()
-    print(f"{'ch':>4} {'pulses':>8} {'nonzero_samples':>16} {'pulse_rate_hz':>14}")
-    print("-" * 50)
-
-    per_ch_pulses = {}
-    per_ch_onsets = {}
-    total_pulses = 0
+    per_ch_pulses, per_ch_onsets, pulse_records = {}, {}, {}
+    flag_counts = {k: 0 for k in ("amp_settle", "charge_recovery", "compliance_limit", "unknown_flags")}
+    unpaired = unbalanced = variable_amplitude = 0
     active_channels = []
-
     for ch in range(n_channels):
-        onsets = find_pulse_onsets(stim[ch])
-        n_pulses = len(onsets)
-        nonzero = int(np.sum(stim[ch] != 0))
-        rate = n_pulses / duration_s if duration_s > 0 else 0
-        per_ch_pulses[ch] = n_pulses
+        decoded = decode_stim_words(stim[ch])
+        for key in flag_counts:
+            flag_counts[key] += int(decoded[key].sum())
+        pulses, missing = extract_biphasic_pulses(stim[ch], sample_rate)
+        unpaired += missing
+        unbalanced += sum(not p["charge_balanced_codes"] for p in pulses)
+        variable_amplitude += sum(not (p["phase1"]["constant_amplitude"] and
+                                      p["phase2"]["constant_amplitude"]) for p in pulses)
+        onsets = np.array([p["onset_sample"] for p in pulses], dtype=np.int64)
         per_ch_onsets[ch] = onsets
-        total_pulses += n_pulses
-        if n_pulses > 0:
-            print(f"{ch:>4} {n_pulses:>8d} {nonzero:>16d} {rate:>14.2f}")
+        per_ch_pulses[ch] = len(pulses)
+        if pulses:
             active_channels.append(ch)
-
-    print("-" * 50)
-    print(f"Total pulses across all channels: {total_pulses}")
-    print(f"Active stim channels: {len(active_channels)} / {n_channels}")
-    if not active_channels:
-        print("\n[WARN] stim.dat is all zeros — no stim was recorded.")
-        print("       Possible causes:")
-        print("         - Recording was in Run mode (not Record); no stim.dat written")
-        print("         - Running in Demo mode (no hardware to commit stim to)")
-        print("         - Stim commands didn't reach RHX")
-        verdict = "NO_STIM_RECORDED"
-    else:
-        verdict = "STIM_VERIFIED"
-
-    # ── Compare with trial_log if present ────────────────────
+            pulse_records[ch] = pulses
+    total_pulses = sum(per_ch_pulses.values())
+    timestamp_source = "recording_sample_index"
+    time_path = data_dir / "time.dat"
+    if time_path.exists():
+        if time_path.stat().st_size != 4 * n_samples:
+            raise ValueError("time.dat and stim.dat sample counts do not match")
+        if n_samples:
+            times = np.memmap(time_path, mode="r", dtype="<u4")
+            for pulses in pulse_records.values():
+                for pulse in pulses:
+                    pulse["raw_rhx_timestamp"] = int(times[pulse["onset_sample"]])
+        timestamp_source = "rhx_time_dat_uint32"
+    if stim_step_ua is not None:
+        for pulses in pulse_records.values():
+            for pulse in pulses:
+                codes = pulse["phase1"]["charge_code_samples"] + pulse["phase2"]["charge_code_samples"]
+                pulse["absolute_charge_nc_from_codes"] = codes * stim_step_ua * 1000 / sample_rate
+    expected = None
     trial_log_path = data_dir / "trial_log.json"
     if trial_log_path.exists():
         trial_log = json.loads(trial_log_path.read_text())
-        total_expected = sum(t.get("total_pulses", 0) for t in trial_log)
-        print()
-        print(f"Trial log: {len(trial_log)} trials, expected ~{total_expected} pulses")
-        if total_pulses > 0:
-            ratio = total_pulses / max(total_expected, 1)
-            print(f"  recorded / expected = {ratio:.2%}")
-            if 0.8 <= ratio <= 1.2:
-                print("  → match within 20% — stim verification passes")
-            else:
-                print("  → mismatch — investigate")
+        if all(isinstance(t.get("total_pulses"), int) and t["total_pulses"] >= 0 for t in trial_log):
+            expected = sum(t["total_pulses"] for t in trial_log)
+    if flag_counts["compliance_limit"]:
+        verdict = "COMPLIANCE_LIMIT_DETECTED"
+    elif unpaired or unbalanced or variable_amplitude or flag_counts["unknown_flags"]:
+        verdict = "INVALID_STIM_DATA"
+    elif total_pulses == 0:
+        verdict = "NO_STIM_RECORDED"
+    elif expected is not None and total_pulses != expected:
+        verdict = "STIM_COUNT_MISMATCH"
+    elif expected is not None:
+        verdict = "STIM_RECORDED_COUNT_MATCH"
+    else:
+        verdict = "STIM_RECORDED_UNVERIFIED"
+    print(f"Digital record: {total_pulses} complete biphasic pulses; {verdict}")
+    print("Electrical delivery/timing is not verified by a nonzero digital record.")
 
     # ── Plot ─────────────────────────────────────────────────
     if plot and active_channels:
@@ -190,12 +251,21 @@ def summarize(data_dir, n_channels=64, n_stim_channels=8, plot=True):
     # ── Save structured summary ──────────────────────────────
     summary_out = {
         "verdict": verdict,
+        "physical_delivery_verified": False,
         "n_channels_checked": int(n_channels),
+        "sample_rate_hz": sample_rate,
+        "stim_step_ua": stim_step_ua,
         "duration_s": float(duration_s),
         "total_pulses": int(total_pulses),
+        "expected_pulses": expected,
         "active_channels": active_channels,
-        "per_channel_pulses": {int(k): int(v) for k, v in per_ch_pulses.items()
-                                if v > 0},
+        "per_channel_pulses": {int(k): int(v) for k, v in per_ch_pulses.items() if v > 0},
+        "flag_sample_counts": flag_counts,
+        "unpaired_phases": unpaired,
+        "unbalanced_pulses": unbalanced,
+        "variable_amplitude_pulses": variable_amplitude,
+        "pulse_records": pulse_records,
+        "timestamp_source": timestamp_source,
     }
     out_json = data_dir / "stim_verification.json"
     out_json.write_text(json.dumps(summary_out, indent=2))
@@ -213,6 +283,7 @@ def main():
                    help="Override channel count if config.json missing")
     p.add_argument("--no-plot", action="store_true",
                    help="Skip png generation")
+    p.add_argument("--stim-step-ua", type=float, help="Actual RHS current step; never inferred")
     args = p.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -223,6 +294,7 @@ def main():
         data_dir,
         n_channels=args.n_channels or 64,
         plot=not args.no_plot,
+        stim_step_ua=args.stim_step_ua,
     )
 
     log_experiment(

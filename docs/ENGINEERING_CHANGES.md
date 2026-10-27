@@ -74,3 +74,22 @@ its live option is a bench-interface tool, not a validated biological feedback e
 下一批：把5001时钟/STIM marker接入连续分类主入口，统一真实事件训练与在线窗口。
 旧 `realtime_openloop.py` / `realtime_loop.py` 的标签、分窗及机械臂任务整合尚未完成；
 第一批的模式检查会阻止它们直接沿用旧的未确认触发路径。
+
+## 3. Digital stimulation record analysis
+
+- 按官方RHS reader解析uint16位域。amp settle/charge recovery/compliance位不算电流。
+- 识别两个相反极性的phase为一个双相pulse，支持≤5ms的interphase gap，并报告缺相、
+  电荷码不平衡、幅度变化和compliance limit。
+- 没有实际电流step时不换算nC；提供step后按幅度码与采样时间积分计算。
+- time.dat存在时校验样本数并保存原始RHX时间戳。文件截断或通道数量不符直接失败。
+- 数量不匹配明确标成STIM_COUNT_MISMATCH；即使数量匹配也只标
+  STIM_RECORDED_COUNT_MATCH，`physical_delivery_verified`始终为false。
+- 前端使用RHX实际保存路径，只分析本次唯一新录音；禁止回退到最近的旧录音。
+- 默认pytest只收集tests/，不会导入会连接实验硬件的experiments/test_5002_*.py。
+
+Digital status bits no longer count as current, and two phases count as one pulse. Actual
+current step size is required for charge conversion. Count matching is explicitly separated
+from electrical delivery verification; old or ambiguous recording directories are rejected.
+
+依据：官方 `Engine/Processing/DataFileReaders/filepersignaltypemanager.cpp` 的位域解码；
+随库RHX 3.5.0 TCP文档规定InterphaseDelayMicroseconds为0..5000µs。

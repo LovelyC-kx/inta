@@ -294,7 +294,8 @@ def _build_manual_protocol(config):
 
 
 def _recording_snapshot(data_root):
-    data_root.mkdir(parents=True, exist_ok=True)
+    if not data_root.is_dir():
+        raise RuntimeError("RHX recording path is not accessible on this computer")
     return set(os.listdir(data_root))
 
 
@@ -308,10 +309,18 @@ def _new_recording_dirs(data_root, before):
     return dirs
 
 
+def _require_new_recording(data_root, before):
+    candidates = [p for p in _new_recording_dirs(data_root, before)
+                  if (p / "stim.dat").exists()]
+    if len(candidates) != 1:
+        raise RuntimeError("Expected exactly one new RHX recording; refusing an old or ambiguous directory")
+    return candidates[0]
+
+
 def _file_info(path):
     return {
         "name": path.name,
-        "path": str(path.relative_to(ROOT)),
+        "path": str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path),
         "modified": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
         "files": {
             fn: ((path / fn).stat().st_size if (path / fn).exists() else None)
@@ -410,7 +419,7 @@ def _run_single_stim_job(config):
             )
         )
 
-        before = _recording_snapshot(DATA_ROOT)
+        before = None
 
         log_event(f"Connecting command TCP {host}:{port}.")
         client = _connect_command(host, port, timeout=8.0, execution_mode="live")
@@ -442,6 +451,8 @@ def _run_single_stim_job(config):
         if experiment_state.get("emergency_stop"):
             raise RuntimeError("Emergency stop requested before Record.")
 
+        record_root = Path(_parse_return_value(client.get("Filename.Path")))
+        before = _recording_snapshot(record_root)
         log_event("Starting Record.")
         client.record()
         time.sleep(1.5)
@@ -461,6 +472,7 @@ def _run_single_stim_job(config):
         time.sleep(float(config.get("post_trigger_s", 2.0)))
         log_event("Stopping Record.")
         client.stop()
+        client.wait_for_run_mode("Stop")
         time.sleep(4.0)
         try:
             mode = client.get("RunMode")
@@ -474,19 +486,8 @@ def _run_single_stim_job(config):
             client = None
             update_state(tcp_command_connected=False)
 
-        dirs = _new_recording_dirs(DATA_ROOT, before)
-        if not dirs:
-            dirs = sorted(
-                [p for p in DATA_ROOT.iterdir() if p.is_dir()],
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )[:1]
-            log_event("No new directory found by snapshot; using most recent directory.", "warn")
-        if not dirs:
-            raise RuntimeError("No recording directory found.")
-
-        recording = dirs[-1]
-        log_event(f"Recording directory: {recording.relative_to(ROOT)}")
+        recording = _require_new_recording(record_root, before)
+        log_event(f"Recording directory: {recording}")
         if not (recording / "stim.dat").exists():
             raise RuntimeError(f"stim.dat not found in {recording}")
 
@@ -507,7 +508,7 @@ def _run_single_stim_job(config):
             "protocol": protocol_summary,
             "timing": timing,
         })
-        log_event("Stim verification complete.")
+        log_event("Digital stim record analyzed; physical delivery is not verified.")
     except Exception as exc:
         update_state(status="stopped", operation=None, dry_run=True)
         push_event("operation_error", {"message": f"{type(exc).__name__}: {exc}"})
@@ -560,7 +561,7 @@ def _run_manual_single_pulse_job(config):
             )
         )
 
-        before = _recording_snapshot(DATA_ROOT) if record_to_disk else None
+        before = None
 
         log_event(f"Connecting command TCP {host}:{port}.")
         client = _connect_command(host, port, timeout=8.0, execution_mode="live")
@@ -582,6 +583,8 @@ def _run_manual_single_pulse_job(config):
             raise RuntimeError("Emergency stop requested before trigger.")
 
         if record_to_disk:
+            record_root = Path(_parse_return_value(client.get("Filename.Path")))
+            before = _recording_snapshot(record_root)
             log_event("Starting Record.")
             client.record()
         else:
@@ -599,6 +602,7 @@ def _run_manual_single_pulse_job(config):
 
         log_event("Stopping RHX.")
         client.stop()
+        client.wait_for_run_mode("Stop")
         time.sleep(4.0)
 
         result_payload = {
@@ -609,19 +613,8 @@ def _run_manual_single_pulse_job(config):
         }
 
         if record_to_disk:
-            dirs = _new_recording_dirs(DATA_ROOT, before)
-            if not dirs:
-                dirs = sorted(
-                    [p for p in DATA_ROOT.iterdir() if p.is_dir()],
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )[:1]
-                log_event("No new directory found by snapshot; using most recent directory.", "warn")
-            if not dirs:
-                raise RuntimeError("No recording directory found.")
-
-            recording = dirs[-1]
-            log_event(f"Recording directory: {recording.relative_to(ROOT)}")
+            recording = _require_new_recording(record_root, before)
+            log_event(f"Recording directory: {recording}")
             if not (recording / "stim.dat").exists():
                 raise RuntimeError(f"stim.dat not found in {recording}")
 
@@ -736,7 +729,7 @@ def rhx_control():
         )
         return jsonify({"ok": True, **result})
     except Exception as exc:
-        update_state(tcp_command_connected=False)
+        update_state(tcp_command_connected=False, run_mode="Unknown")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
 
 

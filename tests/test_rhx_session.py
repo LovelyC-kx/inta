@@ -173,3 +173,39 @@ def test_command_injection_cannot_bypass_mode():
     with pytest.raises(ValueError):
         c.send_command("Get RunMode;Execute ManualStimTriggerPulse F1")
     assert c._command_socket.sent == []
+
+
+def test_configuration_union_does_not_count_as_an_executed_trial_budget():
+    c = client()
+    protocols = [StimulusProtocol([Pulse(ch, 0, amplitude_ua=40)], 8, 2000)
+                 for ch in range(8)]
+    c.prepare_protocols(protocols)
+    c.run()
+    for key in range(1, 6):
+        c.send_command(f"Execute ManualStimTriggerPulse F{key}", expect_response=False)
+    with pytest.raises(RuntimeError, match="rolling 2-second charge"):
+        c.send_command("Execute ManualStimTriggerPulse F6", expect_response=False)
+
+
+def test_upload_invalidates_previously_verified_trigger_cache():
+    c = client()
+    c.prepare_protocols([protocol()])
+    c.send_command("Execute UploadStimParameters", expect_response=False)
+    with pytest.raises(RuntimeError, match="no verified uploaded"):
+        c.send_command("Execute ManualStimTriggerPulse F1", expect_response=False)
+
+
+def test_silent_disable_drop_on_other_headstage_is_detected():
+    c = client()
+    sock = c._command_socket
+    sock.values.update({"b.numberamplifierchannels": "1", "b-000.stimenabled": "true"})
+    send = sock.sendall
+
+    def drop_one_set(data):
+        if data != b"Set B-000.stimenabled false;":
+            send(data)
+
+    sock.sendall = drop_one_set
+    with pytest.raises(RuntimeError, match="B-000.stimenabled"):
+        c.prepare_protocols([protocol()])
+    assert not c._prepared_profiles

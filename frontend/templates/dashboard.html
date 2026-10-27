@@ -457,7 +457,7 @@ pre {
       </div>
       <div class="metric">
         <div id="metricVerified" class="value">--</div>
-        <div class="label">Verified Pulses</div>
+        <div class="label">Recorded Pulses</div>
       </div>
       <div class="metric">
         <div id="metricRecording" class="value">--</div>
@@ -483,7 +483,7 @@ pre {
     </div>
 
     <div class="panel">
-      <h2>Latest Verification</h2>
+      <h2>Latest Digital Record</h2>
       <div class="body">
         <pre id="latestVerification">No verification yet.</pre>
       </div>
@@ -505,7 +505,7 @@ pre {
               <th>Name</th>
               <th>stim.dat</th>
               <th>amplifier.dat</th>
-              <th>Verified</th>
+              <th>Digital Record</th>
               <th>Active Channels</th>
             </tr>
           </thead>
@@ -774,7 +774,7 @@ async function pollStatus() {
     setBadge('statusBadge', (s.status || 'idle').toUpperCase(), s.status === 'running' ? 'warn' : '');
     setBadge('cmdBadge', s.tcp_command_connected ? 'CMD OK' : 'CMD --', s.tcp_command_connected ? 'good' : '');
     setBadge('modeBadge', 'MODE ' + (s.run_mode || '--'), s.run_mode === 'Record' ? 'warn' : (s.run_mode === 'Stop' ? 'good' : ''));
-    setBadge('stimBadge', s.dry_run === false ? 'LIVE STIM' : 'STIM LOCKED', s.dry_run === false ? 'bad' : '');
+    setBadge('stimBadge', s.dry_run === false ? 'LIVE STIM' : 'ACQUIRE ONLY', s.dry_run === false ? 'bad' : '');
     if (s.latest_protocol) renderProtocol(s.latest_protocol);
     if (s.latest_recording) renderVerification(s.latest_recording);
   } catch (e) {}

@@ -343,7 +343,7 @@ class IntanTCPClient:
             "manualstimtrigger", "uploadstim", "uploadampsettle", "uploadchargerecovery"))
         if (stim_set or stim_execute) and self.execution_mode != "live":
             raise PermissionError(f"{self.execution_mode} does not send stimulation commands")
-        if stim_set:
+        if stim_set or (words[0] == "execute" and action == "uploadstimparameters"):
             self._prepared_profiles.clear()
         if words[0] == "execute" and action == "manualstimtriggeron":
             raise RuntimeError("Latched stimulation is unsupported; use verified pulse scheduling")
@@ -379,7 +379,7 @@ class IntanTCPClient:
         "poststimchargerecovoffmicroseconds",
     })
 
-    def get(self, parameter):
+    def get(self, parameter, timeout=2.0):
         """
         Query a parameter value.
 
@@ -389,7 +389,7 @@ class IntanTCPClient:
         Returns:
             Response string (e.g., "Return: RunMode Stop").
         """
-        return self.send_command(f"Get {parameter}")
+        return self.send_command(f"Get {parameter}", timeout=timeout)
 
     def set(self, parameter, value, expect_response=False, verify=False):
         """
@@ -415,7 +415,7 @@ class IntanTCPClient:
         """Poll confirmed state; never substitute the requested state on error."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            response = self.get("RunMode")
+            response = self.get("RunMode", timeout=max(.01, min(2.0, deadline - time.monotonic())))
             if response == f"Return: RunMode {mode}":
                 return response
             time.sleep(0.05)
@@ -424,7 +424,7 @@ class IntanTCPClient:
     def wait_for_upload(self, timeout=30.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            response = self.get("UploadInProgress")
+            response = self.get("UploadInProgress", timeout=max(.01, deadline - time.monotonic()))
             if response.split()[-1].lower() == "false":
                 return
             time.sleep(0.05)
@@ -563,6 +563,10 @@ class IntanTCPClient:
         protocol.validate_safety()
         if skip_safety_check:
             raise ValueError("Skipping stimulation validation is no longer supported")
+        return self._upload_protocol_profile(protocol, channel_prefix, upload_to_hardware)
+
+    def _upload_protocol_profile(self, protocol, channel_prefix, upload_to_hardware):
+        """Compile profiles only; callers validate each actually executed trial."""
         commands = self.protocol_to_commands(protocol, channel_prefix)
         if self.execution_mode != "live":
             return []
@@ -573,12 +577,15 @@ class IntanTCPClient:
             self._prepared_profiles.clear()
             # Disable all amplifier channels first: F1..F8 triggers are global,
             # so a previous session's other headstage must not share a route.
+            disabled_channels = []
             for port in "ABCD":
                 count = int(self.get(f"{port}.NumberAmplifierChannels").split()[-1])
                 if not 0 <= count <= 32:
                     raise RuntimeError("Expected an RHS controller with at most 32 channels per port")
                 for ch in range(count):
-                    self.set(f"{port}-{ch:03d}.stimenabled", "false")
+                    name = f"{port}-{ch:03d}"
+                    disabled_channels.append(name)
+                    self.set(f"{name}.stimenabled", "false")
                     time.sleep(self.INTER_COMMAND_DELAY_S)
             results = []
             for cmd, _ in commands:
@@ -602,6 +609,13 @@ class IntanTCPClient:
                     matches = actual.casefold() == expected.casefold()
                 if not matches:
                     raise RuntimeError(f"RHX profile mismatch: {param}={actual}, expected {expected}")
+            active_names = {f"{channel_prefix}-{p.channel:03d}" for p in protocol.pulses}
+            for name in disabled_channels:
+                expected = "true" if name in active_names else "false"
+                if self.get(f"{name}.stimenabled").split()[-1].lower() != expected:
+                    raise RuntimeError(f"RHX profile mismatch: {name}.stimenabled")
+            if active_names - set(disabled_channels):
+                raise RuntimeError("A requested stimulation channel is absent from the RHS inventory")
             for pulse in protocol.pulses:
                 self._prepared_profiles[f"f{pulse.channel + 1}"] = self._pulse_signature(pulse)
             results.append(("Execute UploadStimParameters", None))
@@ -628,7 +642,9 @@ class IntanTCPClient:
                 profiles[pulse.channel] = signature
         pulses = [Pulse(ch, 0.0, *sig) for ch, sig in sorted(profiles.items())]
         union = StimulusProtocol(pulses, n_channels, 2000.0)
-        return self.send_protocol_config(union, channel_prefix, upload_to_hardware=True)
+        # The union is a configuration table, not an executed trial. Each
+        # actual protocol was validated above and is checked again at playback.
+        return self._upload_protocol_profile(union, channel_prefix, True)
 
     def play_prepared_protocol(self, protocol, cancel_event=None):
         """Trigger every event using an already uploaded profile.

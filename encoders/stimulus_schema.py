@@ -20,7 +20,7 @@ from MaxOne / Wang et al. and are NOT directly applicable to Intan RHS.
 This schema uses CURRENT in microamps as the primary parameter.
 
 Default: charge-balanced biphasic, cathodic-first, 10 µA, 500 µs/phase.
-This is a typical conservative starting point for in vitro stimulation.
+These are software defaults; electrode-specific electrical validation is required.
 
 Safety constraints (defaults; can be made stricter via validate_safety):
     - Max amplitude per pulse: 50 µA
@@ -57,6 +57,7 @@ DEFAULT_WAVEFORM = "Biphasic"
 # Hard safety ceilings (raise consciously; never silently)
 SAFETY_MAX_AMPLITUDE_UA = 50.0       # Refuse pulses above this
 SAFETY_MAX_PHASE_DURATION_US = 5000.0  # RHS allows up to 5 ms/phase
+SAFETY_MAX_INTERPHASE_DELAY_US = 5000.0  # RHX 3.5.0 amplifier parameter range
 SAFETY_MAX_CHARGE_PER_PULSE_NC = 25.0  # 50 µA × 500 µs
 SAFETY_MAX_TOTAL_CHARGE_PER_TRIAL_NC = 200.0  # Cumulative across all pulses
 SAFETY_MAX_PULSES_PER_SEC_PER_CH = 5
@@ -205,6 +206,8 @@ class StimulusProtocol:
                                   "only charge-balanced biphasic waveforms are represented")
             if p.waveform == "Biphasic" and p.interphase_delay_us != 0:
                 violations.append("Use BiphasicWithInterphaseDelay for a nonzero interphase delay")
+            if p.interphase_delay_us > SAFETY_MAX_INTERPHASE_DELAY_US:
+                violations.append("interphase delay exceeds RHS 5000 microsecond limit")
             if p.amplitude_ua > max_amplitude_ua:
                 violations.append(
                     f"Pulse ch={p.channel} t={p.time_ms}ms: "
